@@ -28,12 +28,26 @@ Before production launch, set it to your real frontend origin.
 - `/health` checks the database
 - `/` route
 - Production PostgreSQL SSL
+- Additive schema migration for SOC records, sessions, notifications, audit logs and reset tokens
+- Rotating refresh sessions with heartbeat, logout and administrative revocation
+- Authenticated WebSocket endpoint at `/ws?token=<access-token>`
+- Persistent API contract for alerts, incidents, cases, IOCs, assets, rules, intelligence, hunting and reports
 
-## Important
+## Demo data safety
 
-The existing Supabase `users` table is empty, so no existing production users need to be migrated.
+The demo seed is disabled unless `ALLOW_DEMO_SEED=true` and must only be run against an isolated PostgreSQL database. It requires `DEMO_SEED_PASSWORD` from the environment, creates deterministic marked records for Tushar, Deepanshu, Suraj, Aditya and Vansh, and refuses to touch non-demo records.
 
-After deploying this backend, register a test account through:
+Run it only in an isolated environment:
+
+```text
+ALLOW_DEMO_SEED=true DEMO_SEED_PASSWORD='local-only-password' npm run seed:demo
+```
+
+The script is idempotent. It does not run during application startup.
+
+## Registration
+
+Register a test account through:
 
 POST /auth/register
 
@@ -61,7 +75,18 @@ POST /auth/register
 
 Login:
 POST /auth/login
-{ "email": "...", "password": "..." }
+{ "email": "...", "password": "...", "remember": true }
+
+Refresh:
+POST /auth/refresh
+
+Logout and heartbeat:
+POST /auth/logout
+POST /auth/heartbeat
+
+Password reset:
+POST /auth/forgot-password
+POST /auth/reset-password
 
 Authenticated requests:
 Authorization: Bearer <token>
@@ -79,13 +104,27 @@ Health:
 GET /health
 
 
+## SMTP password reset configuration
+
+Production password-reset delivery remains disabled until the following Render environment variables are configured:
+
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_SECURE`
+- `SMTP_USER`
+- `SMTP_PASSWORD`
+- `MAIL_FROM`
+- `PASSWORD_RESET_ORIGIN`
+
+`GET /health/email` reports only whether the required SMTP values are present; it never returns their values.
+
 ## Two administrator accounts
 
-Set the six ADMIN1/ADMIN2 variables in Render. On startup, the backend creates or updates those two accounts as:
+Set the six ADMIN1/ADMIN2 variables in Render. On startup, the backend creates a missing configured account as:
 
 - role = admin
 - approved = true
 
 Passwords are bcrypt-hashed before being stored. Do not put these credentials in GitHub or `.env` committed to the repository.
 
-The bootstrap runs on every startup and intentionally keeps those two configured accounts approved/admin. If you later change an admin password, update the corresponding Render environment variable and redeploy.
+Existing accounts are not overwritten by startup bootstrap. Password changes must use the authenticated password-change flow or an explicitly approved administrative procedure.

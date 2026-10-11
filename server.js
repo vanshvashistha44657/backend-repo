@@ -1,382 +1,166 @@
+const crypto = require("node:crypto");
+const http = require("node:http");
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const { WebSocketServer, WebSocket } = require("ws");
 require("dotenv").config();
 
+const { applyMigrations } = require("./lib/schema");
+const { mailConfiguration, sendPasswordResetEmail } = require("./lib/mailer");
+
+const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === "test" ? "test-only-secret" : null);
+const ACCESS_TTL = process.env.ACCESS_TOKEN_TTL || "15m";
+const REFRESH_DAYS = Number(process.env.REFRESH_TOKEN_DAYS || 30);
+const port = Number(process.env.PORT || 10000);
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : undefined });
+if (!JWT_SECRET && require.main === module) { console.error("JWT_SECRET is not configured."); process.exit(1); }
+
+const origins = (process.env.FRONTEND_URLS || "").split(",").map((value) => value.trim()).filter(Boolean);
 const app = express();
-const port = process.env.PORT || 10000;
+app.use(cors({ origin: (origin, callback) => (!origin || !origins.length || origins.includes(origin) ? callback(null, true) : callback(new Error("CORS origin not allowed"))), credentials: true }));
+app.use(express.json({ limit: "2mb" }));
+const sockets = new Map();
 
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) {
-  console.error("JWT_SECRET is not configured.");
-  process.exit(1);
-}
+const now = () => new Date().toISOString();
+const idHash = (value) => crypto.createHash("sha256").update(value).digest("hex");
+const randomToken = () => crypto.randomBytes(32).toString("base64url");
+const parseJson = (value, fallback) => { if (value == null) return fallback; if (typeof value === "object") return value; try { return JSON.parse(value); } catch { return fallback; } };
+const timestamp = (value) => value ? new Date(value).toISOString() : null;
+const ipOf = (req) => String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+const deviceOf = (req) => { const ua = String(req.headers["user-agent"] || ""); return /mobile/i.test(ua) ? "Mobile browser" : /Firefox/i.test(ua) ? "Firefox browser" : /Edg/i.test(ua) ? "Edge browser" : /Chrome/i.test(ua) ? "Chrome browser" : ua.slice(0, 120) || "Unknown device"; };
 
-const allowedOrigins = (process.env.FRONTEND_URLS || "")
-  .split(",")
-  .map((v) => v.trim())
-  .filter(Boolean);
+function cookies(req) { return Object.fromEntries(String(req.headers.cookie || "").split(";").map((v) => v.trim().split("=")).filter(([key, value]) => key && value).map(([key, value]) => [key, decodeURIComponent(value)])); }
+function refreshCookie(token, remember = true) { const flags = [`Path=/auth`, `HttpOnly`, process.env.NODE_ENV === "production" ? "Secure" : "", process.env.NODE_ENV === "production" ? "SameSite=None" : "SameSite=Lax"]; if (remember) flags.push(`Max-Age=${REFRESH_DAYS * 86400}`); return `sentinelops_refresh=${encodeURIComponent(token)}; ${flags.filter(Boolean).join("; ")}`; }
+function clearRefreshCookie() { return "sentinelops_refresh=; Path=/auth; HttpOnly; Max-Age=0; SameSite=Lax"; }
+function setCookie(res, value) { res.setHeader("Set-Cookie", value); }
+function publicUser(user) { return { id: user.id, name: user.name, email: user.email, role: user.role, approved: user.approved, status: user.approved || user.role === "admin" ? "active" : "pending", created_at: timestamp(user.created_at), createdAt: timestamp(user.created_at), last_login: timestamp(user.last_login), lastLogin: timestamp(user.last_login), mfaEnabled: false }; }
+function uiRole(role) { return ({ admin: "Administrator", manager: "SOC Manager", analyst_l2: "SOC Analyst L2", user: "SOC Analyst L1" })[role] || role; }
+function dbRole(role) { const value = String(role || "").toLowerCase(); return value === "administrator" || value === "admin" ? "admin" : value.includes("manager") ? "manager" : value.includes("l2") ? "analyst_l2" : "user"; }
+function accessToken(user, sessionId) { return jwt.sign({ sub: user.id, email: user.email, role: user.role, sid: sessionId }, JWT_SECRET, { expiresIn: ACCESS_TTL }); }
 
-app.use(
-  cors({
-    origin(origin, callback) {
-      // Allow server-to-server tools/curl and local development.
-      if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-      return callback(new Error("CORS origin not allowed"));
-    },
-    credentials: true,
-  })
-);
+async function record(kind, id) { const result = await pool.query("SELECT * FROM soc_records WHERE kind = $1 AND id = $2", [kind, id]); return result.rows[0] || null; }
+async function records(kind, search = "") { const result = await pool.query("SELECT * FROM soc_records WHERE kind = $1 AND ($2 = '' OR id ILIKE $3 OR payload::text ILIKE $3) ORDER BY created_at DESC", [kind, search, `%${search}%`]); return result.rows.map((row) => ({ ...parseJson(row.payload, {}), id: row.id, createdAt: timestamp(row.created_at), updatedAt: timestamp(row.updated_at) })); }
+async function putRecord(kind, id, payload, options = {}) { const result = await pool.query(`INSERT INTO soc_records (id,kind,payload,owner_user_id,is_demo,demo_key) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now() RETURNING *`, [id, kind, JSON.stringify({ ...payload, id }), options.ownerUserId || null, Boolean(options.isDemo), options.demoKey || null]); return { ...payload, id, createdAt: timestamp(result.rows[0].created_at), updatedAt: timestamp(result.rows[0].updated_at) }; }
+async function patchRecord(kind, id, patch) { const row = await record(kind, id); if (!row) return null; return putRecord(kind, id, { ...parseJson(row.payload, {}), ...patch }); }
+async function audit(actor, action, resource, req, values = {}) { await pool.query("INSERT INTO audit_logs (actor_user_id,actor_email,action,resource,ip,previous_value,new_value,result) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)", [actor?.id || null, actor?.email || "system", action, resource, ipOf(req), values.previous || null, values.next || null, values.result || "success"]); }
+function emit(userId, event) { for (const socket of sockets.get(String(userId)) || []) if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(event)); }
+function broadcast(event) { for (const userSockets of sockets.values()) for (const socket of userSockets) if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(event)); }
+async function notify(userId, data) { const key = data.eventKey || `${data.category}:${data.title}:${userId}`; const result = await pool.query(`INSERT INTO notifications (user_id,title,body,severity,category,link,event_key) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (user_id,event_key) DO NOTHING RETURNING *`, [userId, data.title, data.body, data.severity || "info", data.category || "system", data.link || null, key]); if (!result.rowCount) return null; const row = result.rows[0]; emit(userId, { id: String(row.id), at: timestamp(row.created_at), kind: "notification", severity: row.severity, message: row.title, detail: row.body }); return row; }
+async function notifyUsers(data) { const result = await pool.query("SELECT id FROM users WHERE approved = true OR role = 'admin'"); for (const user of result.rows) await notify(user.id, data); }
 
-app.use(express.json());
+async function createSession(user, req, remember = true) { const refresh = randomToken(); const result = await pool.query("INSERT INTO sessions (user_id,refresh_token_hash,expires_at,ip,user_agent,device,current) VALUES ($1,$2,now() + ($3 * interval '1 day'),$4,$5,$6,true) RETURNING *", [user.id, idHash(refresh), REFRESH_DAYS, ipOf(req), String(req.headers["user-agent"] || ""), deviceOf(req)]); await pool.query("UPDATE sessions SET current = false WHERE user_id = $1 AND id <> $2 AND status = 'active'", [user.id, result.rows[0].id]); return { row: result.rows[0], refresh, remember }; }
+async function sessionFor(id, userId) { if (!id) return null; const result = await pool.query("SELECT * FROM sessions WHERE id = $1 AND user_id = $2", [id, userId]); return result.rows[0] || null; }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production"
-    ? { rejectUnauthorized: false }
-    : undefined,
-});
-
-function publicUser(user) {
-  return {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    role: user.role,
-    approved: user.approved,
-    created_at: user.created_at,
-  };
-}
-
-function signToken(user) {
-  return jwt.sign(
-    {
-      sub: user.id,
-      email: user.email,
-      role: user.role,
-    },
-    JWT_SECRET,
-    { expiresIn: "7d" }
-  );
-}
-
-function requireAuth(req, res, next) {
-  const header = req.headers.authorization || "";
-  const [scheme, token] = header.split(" ");
-
-  if (scheme !== "Bearer" || !token) {
-    return res.status(401).json({ message: "Authentication required" });
-  }
-
+async function requireAuth(req, res, next) {
+  const [scheme, token] = String(req.headers.authorization || "").split(" ");
+  if (scheme !== "Bearer" || !token) return res.status(401).json({ message: "Authentication required" });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ message: "Invalid or expired token" });
-  }
+    const payload = jwt.verify(token, JWT_SECRET); const result = await pool.query("SELECT * FROM users WHERE id = $1", [payload.sub]); const user = result.rows[0];
+    if (!user || (!user.approved && user.role !== "admin")) return res.status(401).json({ message: "Account is not active" });
+    if (payload.sid) { const session = await sessionFor(payload.sid, user.id); if (!session || session.status !== "active" || new Date(session.expires_at) <= new Date()) { if (session) await pool.query("UPDATE sessions SET status = 'expired' WHERE id = $1 AND status = 'active'", [session.id]); return res.status(401).json({ message: "Session expired" }); } if (Date.now() - new Date(session.last_activity).getTime() > 15000) await pool.query("UPDATE sessions SET last_activity = now() WHERE id = $1", [session.id]); req.session = session; }
+    req.user = user; return next();
+  } catch { return res.status(401).json({ message: "Invalid or expired token" }); }
 }
+function requireAdmin(req, res, next) { return req.user?.role === "admin" ? next() : res.status(403).json({ message: "Admin access required" }); }
+function requireManager(req, res, next) { return ["admin", "manager"].includes(req.user?.role) ? next() : res.status(403).json({ message: "Manager access required" }); }
 
-function requireAdmin(req, res, next) {
-  if (req.user?.role !== "admin") {
-    return res.status(403).json({ message: "Admin access required" });
-  }
-  next();
-}
+function alertPayload(row) { return { id: row.id, title: row.title || row.name || "Alert", rule: row.rule || "", ruleId: row.ruleId || row.rule_id || "", severity: row.severity || "info", status: row.status || "new", sourceIp: row.sourceIp || row.source_ip || "", destinationIp: row.destinationIp || row.destination_ip || "", host: row.host || "", user: row.user || row.username || "", mitreTechnique: row.mitreTechnique || row.mitre_technique || "", mitreName: row.mitreName || row.mitre_name || "", tactic: row.tactic || "", assignee: row.assignee || null, timestamp: timestamp(row.timestamp || row.created_at), description: row.description || "", rawEvent: row.rawEvent || row.raw_event || {}, relatedIncidentId: row.relatedIncidentId || row.related_incident_id || null, notes: row.notes || [], timeline: row.timeline || [], riskScore: Number(row.riskScore || row.risk_score || 0) }; }
+function incidentPayload(row) { return { id: row.id, title: row.title || "Incident", severity: row.severity || "info", priority: row.priority || "P4", status: row.status || "open", assignee: row.assignee || null, createdAt: timestamp(row.createdAt || row.created_at), updatedAt: timestamp(row.updatedAt || row.updated_at), affectedAssets: row.affectedAssets || [], alertIds: row.alertIds || [], caseIds: row.caseIds || [], mitre: row.mitre || [], summary: row.summary || "", resolution: row.resolution || null, timeline: row.timeline || [], notes: row.notes || [], evidence: row.evidence || [] }; }
+function sessionPayload(row) { return { id: String(row.id), userId: row.user_id, name: row.name, email: row.email, role: uiRole(row.role), loginAt: timestamp(row.started_at), lastActivity: timestamp(row.last_activity), ip: row.ip, device: row.device, location: row.location, current: row.current }; }
+function notificationPayload(row) { return { id: String(row.id), title: row.title, body: row.body, severity: row.severity, category: row.category, read: row.read, createdAt: timestamp(row.created_at), link: row.link || undefined }; }
+function listRoute(kind, mapper) { return async (req, res) => res.json((await records(kind, String(req.query.search || ""))).map(mapper || ((value) => value))); }
 
-async function ensureSchema() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-      name text NOT NULL DEFAULT '',
-      email text UNIQUE NOT NULL,
-      password_hash text NOT NULL,
-      role text NOT NULL DEFAULT 'user',
-      approved boolean NOT NULL DEFAULT false,
-      created_at timestamptz NOT NULL DEFAULT now()
-    )
-  `);
+app.get("/", (req, res) => res.json({ ok: true, message: "SentinelOps backend is running", health: "/health" }));
+app.get("/health", async (req, res) => { try { await pool.query("SELECT 1"); res.json({ ok: true, message: "Backend and database are healthy", email: mailConfiguration().configured ? "configured" : "not_configured" }); } catch { res.status(500).json({ ok: false, error: "Database connection failed" }); } });
+app.get("/health/email", (req, res) => res.json(mailConfiguration()));
 
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS approved boolean NOT NULL DEFAULT false
-  `);
-
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS name text NOT NULL DEFAULT ''
-  `);
-
-  // Keep the extension available for UUID generation on standard Supabase Postgres.
-  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
-}
-
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    message: "SentinelOps backend is running",
-    health: "/health",
-  });
-});
-
-app.get("/health", async (req, res) => {
-  if (!process.env.DATABASE_URL) {
-    return res.status(500).json({
-      ok: false,
-      error: "DATABASE_URL is not configured",
-    });
-  }
-
-  try {
-    await pool.query("SELECT 1");
-    res.json({
-      ok: true,
-      message: "Backend and database are healthy",
-    });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: "Database connection failed",
-    });
-  }
-});
-
-app.get("/alerts", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT * FROM alerts
-      ORDER BY created_at DESC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.get("/incidents", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT * FROM incidents
-      ORDER BY created_at DESC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.get("/assets", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT * FROM assets
-      ORDER BY created_at DESC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// Register a new user. New accounts require admin approval.
 app.post("/auth/register", async (req, res) => {
-  const name = String(req.body?.name || "").trim();
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const password = String(req.body?.password || "");
-
-  if (!name || !email || !password) {
-    return res.status(400).json({ message: "Email and password required" });
-  }
-
-  if (password.length < 8) {
-    return res.status(400).json({
-      message: "Password must be at least 8 characters",
-    });
-  }
-
-  try {
-    const existing = await pool.query(
-      "SELECT id FROM users WHERE email = $1 LIMIT 1",
-      [email]
-    );
-
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ message: "Account already exists" });
-    }
-
-    const passwordHash = await bcrypt.hash(password, 12);
-
-    const result = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role, approved)
-       VALUES ($1, $2, $3, 'user', false)
-       RETURNING id, name, email, role, approved, created_at`,
-      [name, email, passwordHash]
-    );
-
-    return res.status(201).json({
-      message: "Account created. Waiting for admin approval.",
-      user: result.rows[0],
-    });
-  } catch (err) {
-    console.error("Register error:", err);
-    return res.status(500).json({ message: "Unable to create account" });
-  }
+  const name = String(req.body?.name || "").trim(); const email = String(req.body?.email || "").trim().toLowerCase(); const password = String(req.body?.password || "");
+  if (!name || !email || !password) return res.status(400).json({ message: "Name, email and password required" }); if (password.length < 8) return res.status(400).json({ message: "Password must be at least 8 characters" });
+  try { const exists = await pool.query("SELECT id FROM users WHERE email = $1", [email]); if (exists.rowCount) return res.status(409).json({ message: "Account already exists" }); const result = await pool.query("INSERT INTO users (name,email,password_hash,role,approved,department,justification) VALUES ($1,$2,$3,'user',false,$4,$5) RETURNING *", [name, email, await bcrypt.hash(password, 12), req.body.department || null, req.body.justification || null]); await audit(null, "user.register", `users/${result.rows[0].id}`, req, { next: { email } }); res.status(201).json({ message: "Account created. Waiting for admin approval.", user: publicUser(result.rows[0]) }); } catch (error) { console.error("Register error:", error.message); res.status(500).json({ message: "Unable to create account" }); }
 });
-
 app.post("/auth/login", async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const password = String(req.body?.password || "");
-
-  if (!email || !password) {
-    return res.status(400).json({ message: "Email and password required" });
-  }
-
-  try {
-    const result = await pool.query(
-      `SELECT id, name, email, password_hash, role, approved, created_at
-       FROM users
-       WHERE email = $1
-       LIMIT 1`,
-      [email]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(401).json({ message: "Invalid credentials" });
-    }
-
-    const user = result.rows[0];
-    const passwordMatches = await bcrypt.compare(password, user.password_hash);
-
-    if (!passwordMatches) {
-      return res.status(401).json({ message: "Invalid credentials" });
-    }
-
-    if (!user.approved && user.role !== "admin") {
-      return res.status(403).json({
-        message: "Account is awaiting admin approval",
-        code: "ACCOUNT_PENDING",
-      });
-    }
-
-    const token = signToken(user);
-
-    return res.json({
-      token,
-      user: publicUser(user),
-    });
-  } catch (err) {
-    console.error("Login error:", err);
-    return res.status(500).json({ message: "Login failed" });
-  }
+  const email = String(req.body?.email || "").trim().toLowerCase(); const password = String(req.body?.password || ""); if (!email || !password) return res.status(400).json({ message: "Email and password required" });
+  try { const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]); const user = result.rows[0]; if (!user || !(await bcrypt.compare(password, user.password_hash))) { await audit(null, "user.login", "auth", req, { result: "failure", next: { email } }); return res.status(401).json({ message: "Invalid credentials" }); } if (!user.approved && user.role !== "admin") return res.status(403).json({ message: "Account is awaiting admin approval", code: "ACCOUNT_PENDING" }); const session = await createSession(user, req, req.body.remember !== false); await pool.query("UPDATE users SET last_login = now() WHERE id = $1", [user.id]); await audit(user, "user.login", `users/${user.id}`, req); setCookie(res, refreshCookie(session.refresh, session.remember)); res.json({ token: accessToken(user, session.row.id), user: publicUser({ ...user, last_login: new Date() }) }); } catch (error) { console.error("Login error:", error.message); res.status(500).json({ message: "Login failed" }); }
 });
+app.post("/auth/refresh", async (req, res) => { const token = cookies(req).sentinelops_refresh || req.body?.refresh_token; if (!token) return res.status(401).json({ message: "Refresh token required" }); const result = await pool.query("SELECT s.id AS session_id,s.user_id AS session_user_id,s.refresh_token_hash,s.status,s.expires_at,s.started_at,s.last_activity,s.revoked_at,s.ip,s.user_agent,s.device,s.location,s.current,u.id,u.name,u.email,u.password_hash,u.role,u.approved,u.created_at,u.last_login FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.refresh_token_hash=$1", [idHash(token)]); const row = result.rows[0]; if (!row || row.status !== "active" || new Date(row.expires_at) <= new Date()) return res.status(401).json({ message: "Refresh token expired" }); const replacement = randomToken(); await pool.query("UPDATE sessions SET refresh_token_hash=$1,last_activity=now() WHERE id=$2", [idHash(replacement), row.session_id]); setCookie(res, refreshCookie(replacement)); res.json({ token: accessToken(row, row.session_id), user: publicUser(row) }); });
+app.get("/auth/me", requireAuth, (req, res) => res.json({ user: publicUser(req.user) }));
+app.post("/auth/heartbeat", requireAuth, async (req, res) => { if (req.session) await pool.query("UPDATE sessions SET last_activity=now() WHERE id=$1", [req.session.id]); res.json({ ok: true }); });
+app.post("/auth/logout", requireAuth, async (req, res) => { if (req.session) await pool.query("UPDATE sessions SET status='revoked',revoked_at=now(),current=false WHERE id=$1", [req.session.id]); await audit(req.user, "user.logout", `sessions/${req.session?.id || "legacy"}`, req); setCookie(res, clearRefreshCookie()); res.json({ ok: true }); });
+app.get("/auth/sessions", requireAuth, async (req, res) => { const result = await pool.query("SELECT s.*,u.name,u.email,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.user_id=$1 AND s.status='active' ORDER BY last_activity DESC", [req.user.id]); res.json(result.rows.map(sessionPayload)); });
+app.delete("/auth/sessions/:id", requireAuth, async (req, res) => { const result = await pool.query("UPDATE sessions SET status='revoked',revoked_at=now(),current=false WHERE id=$1 AND user_id=$2 RETURNING id", [req.params.id, req.user.id]); if (!result.rowCount) return res.status(404).json({ message: "Session not found" }); res.json({ ok: true }); });
+app.post("/auth/change-password", requireAuth, async (req, res) => { const current = String(req.body?.current || ""); const next = String(req.body?.next || ""); const result = await pool.query("SELECT password_hash FROM users WHERE id=$1", [req.user.id]); if (!next || next.length < 10 || !result.rowCount || !(await bcrypt.compare(current, result.rows[0].password_hash))) return res.status(400).json({ message: "Current password or new password is invalid" }); await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2", [await bcrypt.hash(next, 12), req.user.id]); await pool.query("UPDATE sessions SET status='revoked',revoked_at=now(),current=false WHERE user_id=$1 AND id <> $2", [req.user.id, req.session?.id || null]); await notify(req.user.id, { title: "Password changed", body: "Your SentinelOps password was changed.", severity: "low", category: "password_change", link: "/settings", eventKey: `password-change:${Date.now()}` }); res.json({ ok: true }); });
 
-app.get("/auth/me", requireAuth, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, name, email, role, approved, created_at
-       FROM users
-       WHERE id = $1
-       LIMIT 1`,
-      [req.user.sub]
-    );
+app.post("/auth/forgot-password", async (req, res) => { const email = String(req.body?.email || "").trim().toLowerCase(); try { const result = await pool.query("SELECT id,name,email FROM users WHERE email=$1 AND (approved=true OR role='admin')", [email]); if (result.rowCount) { const token = randomToken(); await pool.query("UPDATE password_reset_tokens SET used_at=now() WHERE user_id=$1 AND used_at IS NULL", [result.rows[0].id]); await pool.query("INSERT INTO password_reset_tokens (user_id,token_hash,expires_at) VALUES ($1,$2,now()+interval '30 minutes')", [result.rows[0].id, idHash(token)]); try { await sendPasswordResetEmail({ to: result.rows[0].email, name: result.rows[0].name, token }); } catch (error) { if (error.code !== "SMTP_NOT_CONFIGURED") console.error("Password reset email error:", error.message); } } } catch (error) { console.error("Password reset request error:", error.message); } res.status(202).json({ ok: true }); });
+app.post("/auth/reset-password", async (req, res) => { const token = String(req.body?.token || ""); const password = String(req.body?.password || req.body?.next || ""); if (!token || password.length < 10) return res.status(400).json({ message: "Reset token or password is invalid" }); const client = await pool.connect(); try { await client.query("BEGIN"); const result = await client.query("SELECT * FROM password_reset_tokens WHERE token_hash=$1 AND used_at IS NULL AND expires_at>now() FOR UPDATE", [idHash(token)]); if (!result.rowCount) { await client.query("ROLLBACK"); return res.status(400).json({ message: "Reset link is invalid or expired" }); } await client.query("UPDATE users SET password_hash=$1 WHERE id=$2", [await bcrypt.hash(password, 12), result.rows[0].user_id]); await client.query("UPDATE password_reset_tokens SET used_at=now() WHERE id=$1", [result.rows[0].id]); await client.query("UPDATE sessions SET status='revoked',revoked_at=now(),current=false WHERE user_id=$1", [result.rows[0].user_id]); await client.query("COMMIT"); res.json({ ok: true }); } catch (error) { await client.query("ROLLBACK"); res.status(500).json({ message: "Unable to reset password" }); } finally { client.release(); } });
 
-    if (result.rows.length === 0) {
-      return res.status(401).json({ message: "User no longer exists" });
-    }
+app.get("/alerts", requireAuth, async (req, res) => { let items = (await records("alert", String(req.query.search || ""))).map(alertPayload); const values = (key) => String(req.query[key] || "").split(",").filter(Boolean); const severities = values("severity"); const statuses = values("status"); if (severities.length) items = items.filter((item) => severities.includes(item.severity)); if (statuses.length) items = items.filter((item) => statuses.includes(item.status)); if (req.query.mitre) items = items.filter((item) => item.mitreTechnique === req.query.mitre); if (req.query.host) items = items.filter((item) => item.host === req.query.host); if (req.query.sourceIp) items = items.filter((item) => item.sourceIp.includes(String(req.query.sourceIp))); if (req.query.hours) { const cutoff = Date.now() - Number(req.query.hours) * 3600000; items = items.filter((item) => new Date(item.timestamp).getTime() >= cutoff); } const page = Math.max(Number(req.query.page || 1), 1); const pageSize = Math.min(Math.max(Number(req.query.pageSize || 15), 1), 100); res.json({ items: items.slice((page - 1) * pageSize, page * pageSize), total: items.length, page, pageSize }); });
+app.get("/alerts/:id", requireAuth, async (req, res) => { const row = await record("alert", req.params.id); if (!row) return res.status(404).json({ message: "Alert not found" }); res.json(alertPayload({ ...parseJson(row.payload, {}), id: row.id, created_at: row.created_at })); });
+app.patch("/alerts/:id", requireAuth, async (req, res) => { const patch = {}; for (const key of ["status", "assignee", "severity", "description"]) if (key in req.body) patch[key] = req.body[key]; const updated = await patchRecord("alert", req.params.id, patch); if (!updated) return res.status(404).json({ message: "Alert not found" }); await audit(req.user, "alert.update", `alerts/${req.params.id}`, req, { next: patch }); await notifyUsers({ title: "Alert updated", body: `${req.params.id} was updated`, severity: updated.severity, category: "admin_action", link: "/alerts", eventKey: `alert-update:${req.params.id}:${updated.updatedAt}` }); broadcast({ id: `alert-${req.params.id}`, at: now(), kind: "alert", severity: updated.severity, message: updated.title, detail: req.params.id }); res.json(alertPayload(updated)); });
+app.post("/alerts/:id/notes", requireAuth, async (req, res) => { const row = await record("alert", req.params.id); if (!row) return res.status(404).json({ message: "Alert not found" }); const payload = parseJson(row.payload, {}); payload.notes = [{ id: `note-${Date.now()}`, author: req.user.name, body: String(req.body?.body || ""), createdAt: now() }, ...(payload.notes || [])]; res.json(alertPayload(await putRecord("alert", row.id, payload))); });
 
-    res.json({ user: publicUser(result.rows[0]) });
-  } catch (err) {
-    res.status(500).json({ message: "Unable to load user" });
-  }
-});
+app.get("/incidents", requireAuth, listRoute("incident", incidentPayload));
+app.get("/incidents/:id", requireAuth, async (req, res) => { const row = await record("incident", req.params.id); if (!row) return res.status(404).json({ message: "Incident not found" }); res.json(incidentPayload({ ...parseJson(row.payload, {}), id: row.id, created_at: row.created_at })); });
+app.patch("/incidents/:id", requireAuth, async (req, res) => { const patch = {}; for (const key of ["status", "assignee", "severity", "priority", "summary", "resolution"]) if (key in req.body) patch[key] = req.body[key]; const updated = await patchRecord("incident", req.params.id, patch); if (!updated) return res.status(404).json({ message: "Incident not found" }); res.json(incidentPayload(updated)); });
+app.post("/incidents", requireAuth, async (req, res) => { const alert = await record("alert", req.body?.alert_id); if (!alert) return res.status(404).json({ message: "Alert not found" }); const a = alertPayload({ ...parseJson(alert.payload, {}), id: alert.id, created_at: alert.created_at }); const id = `INC-${Date.now()}`; const incident = await putRecord("incident", id, { id, title: `Escalated: ${a.title}`, severity: a.severity, priority: a.severity === "critical" ? "P1" : a.severity === "high" ? "P2" : "P3", status: "open", assignee: a.assignee, createdAt: now(), updatedAt: now(), affectedAssets: [a.host], alertIds: [a.id], caseIds: [], mitre: [a.mitreTechnique], summary: a.description, resolution: null, timeline: [], notes: [], evidence: [] }); await patchRecord("alert", a.id, { relatedIncidentId: id, status: "escalated" }); await notifyUsers({ title: "Incident created", body: `${id} was created from ${a.id}`, severity: a.severity, category: "incident_assignment", link: "/incidents", eventKey: `incident-create:${id}` }); broadcast({ id: `incident-${id}`, at: now(), kind: "incident", severity: a.severity, message: incident.title, detail: id }); res.status(201).json(incidentPayload(incident)); });
 
-// Admin: list users waiting for approval.
-app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT id, name, email, role, approved, created_at
-      FROM users
-      ORDER BY created_at DESC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ message: "Unable to load users" });
-  }
-});
+app.get("/cases", requireAuth, listRoute("case"));
+app.get("/cases/:id", requireAuth, async (req, res) => { const row = await record("case", req.params.id); if (!row) return res.status(404).json({ message: "Case not found" }); res.json(parseJson(row.payload, { id: row.id })); });
+app.post("/cases", requireAuth, async (req, res) => { const id = `CASE-${Date.now()}`; const item = await putRecord("case", id, { id, title: req.body?.title || "Untitled case", status: "open", severity: req.body?.severity || "medium", owner: req.body?.owner || req.user.name, createdAt: now(), updatedAt: now(), summary: req.body?.summary || "", tasks: [], incidentIds: [], alertIds: [], evidence: [], notes: [], timeline: [], attachments: [] }); await notify(req.user.id, { title: "Case created", body: `${id} is ready for investigation`, severity: item.severity, category: "case_update", link: "/cases", eventKey: `case-create:${id}` }); res.status(201).json(item); });
+app.patch("/cases/:id", requireAuth, async (req, res) => { const patch = { ...req.body, updatedAt: now() }; const updated = await patchRecord("case", req.params.id, patch); if (!updated) return res.status(404).json({ message: "Case not found" }); res.json(updated); });
+app.patch("/cases/:caseId/tasks/:taskId", requireAuth, async (req, res) => { const row = await record("case", req.params.caseId); if (!row) return res.status(404).json({ message: "Case not found" }); const payload = parseJson(row.payload, {}); payload.tasks = (payload.tasks || []).map((task) => task.id === req.params.taskId ? { ...task, done: !task.done } : task); payload.updatedAt = now(); res.json(await putRecord("case", row.id, payload)); });
 
-// Admin: approve an account.
-app.patch("/admin/users/:id/approve", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `UPDATE users
-       SET approved = true
-       WHERE id = $1
-       RETURNING id, name, email, role, approved, created_at`,
-      [req.params.id]
-    );
+app.get("/iocs", requireAuth, listRoute("ioc"));
+app.get("/iocs/:id", requireAuth, async (req, res) => { const row = await record("ioc", req.params.id); if (!row) return res.status(404).json({ message: "Indicator not found" }); res.json(parseJson(row.payload, { id: row.id })); });
+app.post("/iocs", requireAuth, async (req, res) => { const id = `IOC-${Date.now()}`; const riskScore = Number(req.body?.riskScore || 0); const item = await putRecord("ioc", id, { id, type: req.body?.type || "ip", value: req.body?.value || "", riskScore, severity: riskScore > 85 ? "critical" : riskScore > 65 ? "high" : riskScore > 45 ? "medium" : "low", tags: req.body?.tags || [], source: req.body?.source || "Internal Analysis", firstSeen: now(), lastSeen: now(), matches: 0, relatedAlertIds: [], relatedIncidentIds: [], description: "Indicator created by an authenticated analyst." }); await notifyUsers({ title: "IOC created", body: `${id} was added to IOC management`, severity: item.severity, category: "ioc_match", link: "/ioc", eventKey: `ioc-create:${id}` }); broadcast({ id: `ioc-${id}`, at: now(), kind: "ioc", severity: item.severity, message: "IOC created", detail: item.value }); res.status(201).json(item); });
+app.delete("/iocs/:id", requireAuth, async (req, res) => { const result = await pool.query("DELETE FROM soc_records WHERE kind='ioc' AND id=$1 RETURNING id", [req.params.id]); if (!result.rowCount) return res.status(404).json({ message: "Indicator not found" }); res.json({ ok: true }); });
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: "User not found" });
-    }
+app.get("/assets", requireAuth, listRoute("asset"));
+app.get("/assets/:id", requireAuth, async (req, res) => { const row = await record("asset", req.params.id); if (!row) return res.status(404).json({ message: "Asset not found" }); res.json(parseJson(row.payload, { id: row.id })); });
+app.get("/rules", requireAuth, listRoute("rule"));
+app.patch("/rules/:id", requireAuth, requireManager, async (req, res) => { const updated = await patchRecord("rule", req.params.id, { enabled: Boolean(req.body?.enabled), updatedAt: now() }); if (!updated) return res.status(404).json({ message: "Detection rule not found" }); await audit(req.user, updated.enabled ? "rule.enable" : "rule.disable", `rules/${req.params.id}`, req); res.json([updated]); });
+app.post("/rules/:id/test", requireAuth, async (req, res) => { if (!(await record("rule", req.params.id))) return res.status(404).json({ message: "Detection rule not found" }); res.json({ matches: 0, sample: [] }); });
 
-    res.json({
-      message: "User approved",
-      user: result.rows[0],
-    });
-  } catch (err) {
-    res.status(500).json({ message: "Unable to approve user" });
-  }
-});
+app.get("/intel/feeds", requireAuth, listRoute("feed"));
+app.patch("/intel/feeds/:id", requireAuth, async (req, res) => { const item = await patchRecord("feed", req.params.id, { enabled: Boolean(req.body?.enabled) }); if (!item) return res.status(404).json({ message: "Threat feed not found" }); res.json(await records("feed")); });
+app.get("/intel/actors", requireAuth, listRoute("actor"));
+app.get("/intel/matches", requireAuth, async (req, res) => res.json((await records("ioc")).sort((a, b) => Number(b.matches || 0) - Number(a.matches || 0)).slice(0, 10)));
+app.get("/hunting/saved", requireAuth, listRoute("hunt"));
+app.post("/hunting/saved", requireAuth, async (req, res) => { const id = `hunt-${Date.now()}`; res.status(201).json(await putRecord("hunt", id, { id, name: req.body?.name || "Untitled hunt", query: req.body?.query || "", createdBy: req.user.name, createdAt: now(), lastRun: now(), results: 0 }, { ownerUserId: req.user.id })); });
+app.post("/hunting/search", requireAuth, async (req, res) => { const value = String(req.body?.value || "").toLowerCase(); const alerts = (await records("alert")).map(alertPayload).filter((item) => !value || JSON.stringify(item).toLowerCase().includes(value)); res.json(alerts.map((item) => ({ id: item.id, timestamp: item.timestamp, host: item.host, user: item.user, process: item.rawEvent?.process || "", commandLine: item.rawEvent?.command_line || "", sourceIp: item.sourceIp, destinationIp: item.destinationIp, mitre: item.mitreTechnique, severity: item.severity, matchedField: req.body?.field || "value" }))); });
 
+app.get("/reports", requireAuth, listRoute("report"));
+app.get("/reports/:id", requireAuth, async (req, res) => { const row = await record("report", req.params.id); if (!row) return res.status(404).json({ message: "Report not found" }); res.json(parseJson(row.payload, { id: row.id })); });
+app.post("/reports", requireAuth, async (req, res) => { const id = `rpt-${Date.now()}`; res.status(201).json(await putRecord("report", id, { id, name: `${req.body?.type || "SOC"} report`, type: req.body?.type || "soc_metrics", period: "Current reporting period", generatedAt: now(), generatedBy: req.user.name, status: "ready", sizeKb: 0, summary: [] })); });
+app.get("/reports/:id/export", requireAuth, async (req, res) => { const row = await record("report", req.params.id); if (!row) return res.status(404).json({ message: "Report not found" }); const report = parseJson(row.payload, {}); if (req.query.format !== "csv") return res.status(501).json({ message: "Only CSV export is available from the API" }); const body = ["metric,value", ...(report.summary || []).map((item) => `${JSON.stringify(item.label)},${JSON.stringify(item.value)}`)].join("\n"); res.type("text/csv").attachment(`${row.id}.csv`).send(body); });
 
-async function bootstrapAdminFromEnv(prefix) {
-  const name = String(process.env[`${prefix}_NAME`] || "").trim();
-  const email = String(process.env[`${prefix}_EMAIL`] || "").trim().toLowerCase();
-  const password = String(process.env[`${prefix}_PASSWORD`] || "");
+app.get("/notifications", requireAuth, async (req, res) => { const result = await pool.query("SELECT * FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100", [req.user.id]); res.json(result.rows.map(notificationPayload)); });
+app.post("/notifications/:id/read", requireAuth, async (req, res) => { await pool.query("UPDATE notifications SET read=true WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]); const result = await pool.query("SELECT * FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100", [req.user.id]); res.json(result.rows.map(notificationPayload)); });
+app.post("/notifications/read-all", requireAuth, async (req, res) => { await pool.query("UPDATE notifications SET read=true WHERE user_id=$1", [req.user.id]); const result = await pool.query("SELECT * FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100", [req.user.id]); res.json(result.rows.map(notificationPayload)); });
 
-  // If none of the variables are configured, do nothing.
-  if (!name && !email && !password) return;
+app.get("/dashboard/metrics", requireAuth, async (req, res) => { const alerts = (await records("alert")).map(alertPayload); const incidents = await records("incident"); const cases = await records("case"); const iocs = await records("ioc"); const assets = await records("asset"); const count = (items, value) => items.filter((item) => item.severity === value).length; const openIncidents = incidents.filter((item) => item.status !== "resolved").length; const activeCases = cases.filter((item) => item.status !== "closed").length; res.json({ criticalAlerts: count(alerts, "critical"), highAlerts: count(alerts, "high"), openIncidents, activeCases, iocMatches: iocs.reduce((sum, item) => sum + Number(item.matches || 0), 0), intelMatches: 0, assetsAtRisk: assets.filter((item) => Number(item.riskScore || 0) > 60).length, securityScore: alerts.length ? Math.max(0, 100 - count(alerts, "critical") * 5 - count(alerts, "high") * 2) : 100, systemHealth: 100, mttrMinutes: 0, falsePositiveRate: alerts.length ? Math.round(alerts.filter((item) => item.status === "false_positive").length / alerts.length * 1000) / 10 : 0, alertToIncident: 0, analystWorkload: [], alertVolume: [], severityDistribution: ["critical", "high", "medium", "low", "info"].map((severity) => ({ name: severity, value: count(alerts, severity), severity })), mitreDistribution: [], incidentTimeline: [], threatActivity: [], topAssets: [], topSourceIps: [], fpTrend: [] }); });
+app.get("/dashboard/feed", requireAuth, async (req, res) => res.json((await records("alert")).map(alertPayload).slice(0, Math.min(Number(req.query.limit || 12), 50))));
+app.get("/system/health", requireAuth, async (req, res) => res.json([{ name: "API Gateway", status: "healthy", latencyMs: 0, uptime: 100 }, { name: "PostgreSQL", status: "healthy", latencyMs: 0, uptime: 100 }]));
 
-  if (!name || !email || !password) {
-    throw new Error(`${prefix}_NAME, ${prefix}_EMAIL and ${prefix}_PASSWORD must all be set`);
-  }
+app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => res.json((await pool.query("SELECT * FROM users ORDER BY created_at DESC")).rows.map(publicUser)));
+app.patch("/admin/users/:id/approve", requireAuth, requireAdmin, async (req, res) => { const result = await pool.query("UPDATE users SET approved=true WHERE id=$1 RETURNING *", [req.params.id]); if (!result.rowCount) return res.status(404).json({ message: "User not found" }); await audit(req.user, "user.approve", `users/${req.params.id}`, req); await notify(req.params.id, { title: "Access approved", body: "Your SentinelOps access request was approved.", severity: "low", category: "admin_action", link: "/", eventKey: `approval:${req.params.id}` }); res.json({ message: "User approved", user: publicUser(result.rows[0]) }); });
+app.patch("/admin/users/:id", requireAuth, requireAdmin, async (req, res) => { const updates = []; const values = []; if (req.body?.role !== undefined) { values.push(dbRole(req.body.role)); updates.push(`role=$${values.length}`); } if (req.body?.status !== undefined || req.body?.approved !== undefined) { values.push(req.body.status === "active" || req.body.approved === true); updates.push(`approved=$${values.length}`); } if (!updates.length) return res.status(400).json({ message: "No supported fields supplied" }); values.push(req.params.id); const result = await pool.query(`UPDATE users SET ${updates.join(",")} WHERE id=$${values.length} RETURNING *`, values); if (!result.rowCount) return res.status(404).json({ message: "User not found" }); await audit(req.user, "user.update", `users/${req.params.id}`, req, { next: req.body }); res.json({ user: publicUser(result.rows[0]) }); });
+app.get("/admin/stats", requireAuth, requireAdmin, async (req, res) => { const [u, pending, active, failed, events] = await Promise.all([pool.query("SELECT count(*)::int AS count FROM users"), pool.query("SELECT count(*)::int AS count FROM users WHERE approved=false AND role<>'admin'"), pool.query("SELECT count(*)::int AS count FROM sessions WHERE status='active' AND expires_at>now()"), pool.query("SELECT count(*)::int AS count FROM audit_logs WHERE action='user.login' AND result='failure' AND created_at>now()-interval '24 hours'"), pool.query("SELECT count(*)::int AS count FROM audit_logs WHERE created_at>now()-interval '24 hours'")]); res.json({ totalUsers: u.rows[0].count, activeUsers: active.rows[0].count, pendingApprovals: pending.rows[0].count, failedLogins24h: failed.rows[0].count, securityEvents24h: events.rows[0].count, services: [{ name: "API Gateway", status: "healthy", latencyMs: 0, uptime: 100 }, { name: "PostgreSQL", status: "healthy", latencyMs: 0, uptime: 100 }] }); });
+app.get("/admin/audit-logs", requireAuth, requireAdmin, async (req, res) => { const search = String(req.query.search || ""); const result = await pool.query("SELECT * FROM audit_logs WHERE ($1='' OR actor_email ILIKE $2 OR action ILIKE $2 OR resource ILIKE $2 OR ip ILIKE $2) ORDER BY created_at DESC LIMIT 200", [search, `%${search}%`]); res.json(result.rows.map((row) => ({ id: String(row.id), user: row.actor_email, action: row.action, resource: row.resource, timestamp: timestamp(row.created_at), ip: row.ip, previousValue: row.previous_value ? JSON.stringify(row.previous_value) : null, newValue: row.new_value ? JSON.stringify(row.new_value) : null, result: row.result }))); });
+app.get("/admin/sessions", requireAuth, requireAdmin, async (req, res) => res.json((await pool.query("SELECT s.*,u.name,u.email,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.status='active' ORDER BY s.last_activity DESC")).rows.map(sessionPayload)));
+app.delete("/admin/sessions/:id", requireAuth, requireAdmin, async (req, res) => { const result = await pool.query("UPDATE sessions SET status='revoked',revoked_at=now(),current=false WHERE id=$1 RETURNING id", [req.params.id]); if (!result.rowCount) return res.status(404).json({ message: "Session not found" }); await audit(req.user, "session.revoke", `sessions/${req.params.id}`, req); res.json({ ok: true }); });
 
-  if (password.length < 8) {
-    throw new Error(`${prefix}_PASSWORD must be at least 8 characters`);
-  }
+app.get("/version", (req, res) => res.json({ application: "SentinelOps", backend: "backend-repo", commit: process.env.RENDER_GIT_COMMIT || "local" }));
 
-  const passwordHash = await bcrypt.hash(password, 12);
+async function bootstrapAdmins() { for (const prefix of ["ADMIN1", "ADMIN2"]) { const name = String(process.env[`${prefix}_NAME`] || "").trim(); const email = String(process.env[`${prefix}_EMAIL`] || "").trim().toLowerCase(); const password = String(process.env[`${prefix}_PASSWORD`] || ""); if (!name && !email && !password) continue; if (!name || !email || !password) throw new Error(`${prefix}_NAME, ${prefix}_EMAIL and ${prefix}_PASSWORD must all be set`); const existing = await pool.query("SELECT id FROM users WHERE email=$1", [email]); if (!existing.rowCount) await pool.query("INSERT INTO users(name,email,password_hash,role,approved) VALUES($1,$2,$3,'admin',true)", [name, email, await bcrypt.hash(password, 12)]); } }
 
-  await pool.query(
-    `INSERT INTO users (name, email, password_hash, role, approved)
-     VALUES ($1, $2, $3, 'admin', true)
-     ON CONFLICT (email)
-     DO UPDATE SET
-       name = EXCLUDED.name,
-       password_hash = EXCLUDED.password_hash,
-       role = 'admin',
-       approved = true`,
-    [name, email, passwordHash]
-  );
-
-  console.log(`Admin account ready: ${email}`);
+async function start(listenPort = port) {
+  await applyMigrations(pool); await bootstrapAdmins(); const server = http.createServer(app); const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", async (request, socket, head) => { try { const url = new URL(request.url, "http://localhost"); if (url.pathname !== "/ws") return socket.destroy(); const token = url.searchParams.get("token"); const payload = jwt.verify(token, JWT_SECRET); const session = await sessionFor(payload.sid, payload.sub); if (!session || session.status !== "active") return socket.destroy(); wss.handleUpgrade(request, socket, head, (client) => { const key = String(payload.sub); client.userId = key; if (!sockets.has(key)) sockets.set(key, new Set()); sockets.get(key).add(client); client.on("close", () => sockets.get(key)?.delete(client)); client.on("message", () => client.send(JSON.stringify({ type: "pong", at: now() }))); }); } catch { socket.destroy(); } });
+  await new Promise((resolve) => server.listen(listenPort, resolve)); return server;
 }
-
-async function start() {
-  try {
-    await ensureSchema();
-    await bootstrapAdminFromEnv("ADMIN1");
-    await bootstrapAdminFromEnv("ADMIN2");
-    console.log("Database schema ready.");
-    app.listen(port, () => {
-      console.log(`Server running on port ${port}`);
-    });
-  } catch (err) {
-    console.error("Database initialization failed:", err);
-    process.exit(1);
-  }
-}
-
-start();
+if (require.main === module) start().catch((error) => { console.error("Database initialization failed:", error.message); process.exit(1); });
+module.exports = { app, pool, start, applyMigrations, __private: { idHash, putRecord, records, notify } };
