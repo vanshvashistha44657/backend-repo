@@ -310,6 +310,8 @@ test("generated reports use persisted SOC data and exports remain usable", async
   const alerts = await request(app).get("/alerts?search=SQL injection").set(auth).expect(200);
   assert.equal(alerts.body.items[0].id, "demo-alert-sqli-001");
   assert.equal(alerts.body.items[0].isDemo, true);
+  const defaultWindowAlerts = await request(app).get("/alerts?hours=168&pageSize=100").set(auth).expect(200);
+  assert.equal(defaultWindowAlerts.body.items.some((item) => item.id === "demo-alert-sqli-001"), true);
   assert.equal((await request(app).get("/incidents").set(auth).expect(200)).body.some((item) => item.id === "demo-incident-sqli-001"), true);
   assert.equal((await request(app).get("/cases").set(auth).expect(200)).body.some((item) => item.id === "demo-case-sqli-001"), true);
   assert.equal((await request(app).get("/iocs").set(auth).expect(200)).body.some((item) => item.id === "demo-ioc-sqli-001"), true);
