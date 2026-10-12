@@ -2,12 +2,28 @@ const { BASE, PEOPLE, ANALYSTS, buildRecords, at } = require("../lib/demo-fixtur
 
 const SEED_PASSWORD = process.env.DEMO_SEED_PASSWORD;
 const DRY_RUN = process.argv.includes("--dry-run") || process.env.DEMO_SEED_DRY_RUN === "true";
+const PRODUCTION_CONFIRMATION = "SENTINELOPS_PRODUCTION_DEMO_SEED_2026";
 let bcrypt;
 let pool;
 let applyMigrations;
 if (!DRY_RUN) {
   bcrypt = require("bcryptjs");
   ({ pool, applyMigrations } = require("../server"));
+}
+
+function validateSeedAuthorization() {
+  if (process.env.ALLOW_DEMO_SEED !== "true") throw new Error("Demo seeding is disabled. Set ALLOW_DEMO_SEED=true only for an isolated or explicitly authorized target.");
+  if (process.env.NODE_ENV !== "production") return;
+  if (process.env.ALLOW_PRODUCTION_DEMO_SEED !== "true") throw new Error("Production demo seeding requires ALLOW_PRODUCTION_DEMO_SEED=true.");
+  if (process.env.DEMO_SEED_CONFIRMATION !== PRODUCTION_CONFIRMATION) throw new Error("Production demo seeding requires the exact DEMO_SEED_CONFIRMATION value.");
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error("Production demo seeding requires DATABASE_URL so the target can be verified.");
+  let target;
+  try { target = new URL(databaseUrl); } catch { throw new Error("DATABASE_URL is not a valid URL."); }
+  const expectedHost = String(process.env.DEMO_SEED_TARGET_HOST || "").trim().toLowerCase();
+  const expectedDatabase = String(process.env.DEMO_SEED_TARGET_DATABASE || "").trim().replace(/^\//, "");
+  if (!expectedHost || target.hostname.toLowerCase() !== expectedHost) throw new Error("Production seed target host does not match DEMO_SEED_TARGET_HOST.");
+  if (!expectedDatabase || target.pathname.replace(/^\//, "") !== expectedDatabase) throw new Error("Production seed target database does not match DEMO_SEED_TARGET_DATABASE.");
 }
 
 function recordDate(value) {
@@ -71,7 +87,7 @@ function proposedRecords(records) {
 }
 
 async function run() {
-  if (!DRY_RUN && (process.env.NODE_ENV === "production" || process.env.ALLOW_DEMO_SEED !== "true")) throw new Error("Demo seeding is disabled. Set ALLOW_DEMO_SEED=true only for an isolated database.");
+  validateSeedAuthorization();
   if (!DRY_RUN && (!SEED_PASSWORD || SEED_PASSWORD.length < 10)) throw new Error("DEMO_SEED_PASSWORD must be supplied through the environment and contain at least 10 characters.");
 
   const records = buildRecords();

@@ -288,6 +288,9 @@ test("demo seed is repeatable, interconnected, and isolated from production mode
   assert.match(JSON.stringify(sqliReport.rows[0].summary), /Production requests sent/);
   const productionEnv = { ...env, NODE_ENV: "production" };
   assert.throws(() => execFileSync(process.execPath, [seed], { env: productionEnv, stdio: "pipe" }));
+  const authorizedDryRunEnv = { ...productionEnv, ALLOW_PRODUCTION_DEMO_SEED: "true", DEMO_SEED_CONFIRMATION: "SENTINELOPS_PRODUCTION_DEMO_SEED_2026", DEMO_SEED_TARGET_HOST: "127.0.0.1", DEMO_SEED_TARGET_DATABASE: "sentinel_test" };
+  execFileSync(process.execPath, [seed, "--dry-run"], { env: authorizedDryRunEnv, stdio: "pipe" });
+  assert.throws(() => execFileSync(process.execPath, [seed, "--dry-run"], { env: { ...authorizedDryRunEnv, DEMO_SEED_TARGET_HOST: "wrong.supabase.example" }, stdio: "pipe" }));
 });
 
 test("generated reports use persisted SOC data and exports remain usable", async () => {
