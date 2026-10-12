@@ -270,12 +270,56 @@ test("two-user network privacy isolates sensors, telemetry, alerts, notification
   assert.equal((await request(app).get("/network/overview").set(authB)).status, 401);
 });
 
-test("demo seed is repeatable and refuses production mode", () => {
+test("demo seed is repeatable, interconnected, and isolated from production mode", async () => {
   const seed = path.join(__dirname, "..", "scripts", "seed-demo.js");
-  const env = { ...process.env, NODE_ENV: "test", ALLOW_DEMO_SEED: "true", DEMO_SEED_PASSWORD: demoSeedPassword };
+  const env = { ...process.env, NODE_ENV: "test", ALLOW_DEMO_SEED: "true", DEMO_SEED_PASSWORD: demoSeedPassword, DATABASE_URL: process.env.DATABASE_URL };
+  await pool.query("INSERT INTO soc_records(id,kind,payload,is_demo) VALUES('demo-alert-sqli-001','alert','{}',false)");
+  assert.throws(() => execFileSync(process.execPath, [seed], { env, stdio: "pipe" }));
+  await pool.query("DELETE FROM soc_records WHERE id='demo-alert-sqli-001'");
   execFileSync(process.execPath, [seed], { env, stdio: "pipe" });
-  const first = Number(execFileSync("docker", ["exec", "sentinelops-backend-test-pg", "psql", "-U", "sentinel", "-d", "sentinel_test", "-tAc", "SELECT count(*) FROM soc_records WHERE is_demo=true"], { encoding: "utf8" }).trim());
+  const first = Number((await pool.query("SELECT count(*)::int AS count FROM soc_records WHERE is_demo=true")).rows[0].count);
   execFileSync(process.execPath, [seed], { env, stdio: "pipe" });
-  const second = Number(execFileSync("docker", ["exec", "sentinelops-backend-test-pg", "psql", "-U", "sentinel", "-d", "sentinel_test", "-tAc", "SELECT count(*) FROM soc_records WHERE is_demo=true"], { encoding: "utf8" }).trim());
+  const second = Number((await pool.query("SELECT count(*)::int AS count FROM soc_records WHERE is_demo=true")).rows[0].count);
   assert.equal(second, first);
+  assert.ok(first >= 99);
+  const linked = await pool.query("SELECT payload->>'relatedIncidentId' AS incident_id FROM soc_records WHERE id='demo-alert-sqli-001' AND is_demo=true");
+  assert.equal(linked.rows[0].incident_id, "demo-incident-sqli-001");
+  const sqliReport = await pool.query("SELECT payload->'summary' AS summary FROM soc_records WHERE id='demo-report-sqli-001' AND is_demo=true");
+  assert.match(JSON.stringify(sqliReport.rows[0].summary), /Production requests sent/);
+  const productionEnv = { ...env, NODE_ENV: "production" };
+  assert.throws(() => execFileSync(process.execPath, [seed], { env: productionEnv, stdio: "pipe" }));
+});
+
+test("generated reports use persisted SOC data and exports remain usable", async () => {
+  const login = await request(app).post("/auth/login").send({ email: testUser.email, password: resetPassword }).expect(200);
+  const auth = { Authorization: `Bearer ${login.body.token}` };
+  const metrics = await request(app).get("/dashboard/metrics").set(auth).expect(200);
+  assert.ok(metrics.body.criticalAlerts >= 1);
+  assert.ok(metrics.body.openIncidents >= 1);
+  assert.ok(metrics.body.activeCases >= 1);
+  const reports = await request(app).get("/reports").set(auth).expect(200);
+  const sqli = reports.body.find((report) => report.id === "demo-report-sqli-001");
+  assert.equal(sqli.isDemo, true);
+  const generated = await request(app).post("/reports").set(auth).send({ type: "incident" }).expect(201);
+  assert.equal(generated.body.status, "ready");
+  assert.ok(generated.body.summary.length >= 3);
+  const csv = await request(app).get(`/reports/${generated.body.id}/export?format=csv`).set(auth).expect(200);
+  assert.match(csv.headers["content-type"], /text\/csv/);
+  assert.match(csv.text, /metric,value/);
+  await request(app).get("/reports/demo-report-sqli-001/export?format=pdf").set(auth).expect(501);
+  const alerts = await request(app).get("/alerts?search=SQL injection").set(auth).expect(200);
+  assert.equal(alerts.body.items[0].id, "demo-alert-sqli-001");
+  assert.equal(alerts.body.items[0].isDemo, true);
+  assert.equal((await request(app).get("/incidents").set(auth).expect(200)).body.some((item) => item.id === "demo-incident-sqli-001"), true);
+  assert.equal((await request(app).get("/cases").set(auth).expect(200)).body.some((item) => item.id === "demo-case-sqli-001"), true);
+  assert.equal((await request(app).get("/iocs").set(auth).expect(200)).body.some((item) => item.id === "demo-ioc-sqli-001"), true);
+  assert.equal((await request(app).get("/assets").set(auth).expect(200)).body.some((item) => item.name === "WEB-LAB-01" && item.isDemo === true), true);
+  assert.equal((await request(app).get("/rules").set(auth).expect(200)).body.some((item) => item.id === "demo-rule-sqli-001"), true);
+  assert.equal((await request(app).get("/intel/feeds").set(auth).expect(200)).body.length >= 4, true);
+  assert.equal((await request(app).get("/intel/actors").set(auth).expect(200)).body.some((item) => item.isDemo === true), true);
+  assert.equal((await request(app).get("/hunting/saved").set(auth).expect(200)).body.some((item) => item.id === "demo-hunt-sqli-001"), true);
+  const hunt = await request(app).post("/hunting/search").set(auth).send({ field: "host", operator: "contains", value: "WEB-LAB-01", hours: 168 }).expect(200);
+  assert.equal(hunt.body.some((item) => item.id === "demo-alert-sqli-001" && item.isDemo === true), true);
+  assert.equal((await request(app).get("/admin/audit-logs?search=demo").set(auth).expect(200)).body.some((item) => item.isDemo === true), true);
+  assert.equal((await request(app).get("/admin/sessions").set(auth).expect(200)).body.some((item) => item.isDemo === true), true);
 });

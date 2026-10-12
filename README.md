@@ -38,9 +38,17 @@ Before production launch, set it to your real frontend origin.
 
 ## Demo data safety
 
-The demo seed is disabled unless `ALLOW_DEMO_SEED=true` and must only be run against an isolated PostgreSQL database. It requires `DEMO_SEED_PASSWORD` from the environment, creates deterministic marked records for Tushar, Deepanshu, Suraj, Aditya and Vansh, and refuses to touch non-demo records.
+The demo seed is disabled unless `ALLOW_DEMO_SEED=true` and must only be run against an isolated PostgreSQL database. It requires `DEMO_SEED_PASSWORD` from the environment, creates deterministic marked records for Tushar, Deepanshu, Suraj, Aditya and Vansh, and refuses to touch non-demo records. The current fixture contains 99 interconnected SOC records across alerts, incidents, cases, IOCs, assets, rules, intelligence, hunting and reports, plus marked sessions, notifications and audit activity.
 
-Run it only in an isolated environment:
+Review the exact proposed records without connecting to PostgreSQL or writing data:
+
+```text
+node scripts/seed-demo.js --dry-run
+```
+
+The dry run identifies the authorized-lab SQL-injection chain (`demo-alert-sqli-001` → `demo-incident-sqli-001` → `demo-case-sqli-001` → `demo-report-sqli-001`) using documentation address `198.51.100.42`, target label `WEB-LAB-01`, and `productionRequestsSent: 0`. It is marked `DEMO`/`SIMULATED` and does not represent a real attack.
+
+Run the write operation only in an isolated environment after reviewing the dry-run output:
 
 ```text
 ALLOW_DEMO_SEED=true DEMO_SEED_PASSWORD='local-only-password' npm run seed:demo
