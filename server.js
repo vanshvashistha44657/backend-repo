@@ -1,5 +1,6 @@
 const crypto = require("node:crypto");
 const http = require("node:http");
+const net = require("node:net");
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -20,9 +21,11 @@ if (!JWT_SECRET && require.main === module) { console.error("JWT_SECRET is not c
 
 const origins = (process.env.FRONTEND_URLS || "").split(",").map((value) => value.trim()).filter(Boolean);
 const app = express();
-app.use(cors({ origin: (origin, callback) => (!origin || !origins.length || origins.includes(origin) ? callback(null, true) : callback(new Error("CORS origin not allowed"))), credentials: true }));
+app.set("trust proxy", 1);
+app.use(cors({ origin: (origin, callback) => (!origin || !origins.length || origins.includes(origin) ? callback(null, true) : callback(new Error("CORS origin not allowed"))), credentials: true, allowedHeaders: ["Content-Type", "Authorization", "X-Sensor-ID", "X-Sensor-Secret"] }));
 app.use(express.json({ limit: "2mb" }));
 const sockets = new Map();
+const sensorRate = new Map();
 
 const now = () => new Date().toISOString();
 const idHash = (value) => crypto.createHash("sha256").update(value).digest("hex");
@@ -67,6 +70,118 @@ async function requireAuth(req, res, next) {
 function requireAdmin(req, res, next) { return req.user?.role === "admin" ? next() : res.status(403).json({ message: "Admin access required" }); }
 function requireManager(req, res, next) { return ["admin", "manager"].includes(req.user?.role) ? next() : res.status(403).json({ message: "Manager access required" }); }
 
+function sensorStatus(row) {
+  if (row.status === "revoked") return "revoked";
+  if (!row.last_heartbeat_at) return "never_reported";
+  const staleAfter = Math.max(Number(row.heartbeat_interval_seconds || 60) * 3, 180) * 1000;
+  return Date.now() - new Date(row.last_heartbeat_at).getTime() <= staleAfter ? "active" : "stale";
+}
+function publicSensor(row) {
+  return {
+    id: String(row.id), name: row.name, hostname: row.hostname, platform: row.platform,
+    sensorVersion: row.sensor_version, status: sensorStatus(row), createdAt: timestamp(row.created_at),
+    lastHeartbeatAt: timestamp(row.last_heartbeat_at), lastObservationAt: timestamp(row.last_observation_at),
+    lastErrorAt: timestamp(row.last_error_at), lastError: row.last_error || null, lastIp: row.last_ip || "",
+    heartbeatIntervalSeconds: row.heartbeat_interval_seconds,
+  };
+}
+function sensorOwnerCanAccess(req, row) { return req.user?.role === "admin" || String(row.owner_user_id) === String(req.user?.id); }
+function sensorHttpsAllowed(req) {
+  const forwarded = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  if (req.secure || forwarded === "https" || process.env.NODE_ENV === "test") return true;
+  return process.env.ALLOW_INSECURE_SENSOR_LOCAL === "true" && ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress);
+}
+function sensorRateAllowed(key) {
+  const current = Date.now(); const previous = sensorRate.get(key) || { started: current, count: 0 };
+  if (current - previous.started >= 60_000) { sensorRate.set(key, { started: current, count: 1 }); return true; }
+  previous.count += 1; sensorRate.set(key, previous); return previous.count <= 120;
+}
+async function requireSensor(req, res, next) {
+  if (!sensorHttpsAllowed(req)) return res.status(400).json({ message: "Sensor telemetry requires HTTPS" });
+  const sensorId = String(req.headers["x-sensor-id"] || "").trim();
+  const secret = String(req.headers["x-sensor-secret"] || "");
+  if (!/^[0-9a-f-]{36}$/i.test(sensorId) || !secret || secret.length > 256) return res.status(401).json({ message: "Sensor credentials required" });
+  if (!sensorRateAllowed(`${sensorId}:${ipOf(req)}`)) return res.status(429).json({ message: "Sensor ingestion rate limit exceeded" });
+  try {
+    const result = await pool.query("SELECT * FROM sensors WHERE id=$1", [sensorId]);
+    const sensor = result.rows[0];
+    if (!sensor || sensor.status !== "active" || sensor.revoked_at || !(await bcrypt.compare(secret, sensor.secret_hash))) return res.status(401).json({ message: "Invalid or revoked sensor credentials" });
+    req.sensor = sensor;
+    next();
+  } catch { return res.status(401).json({ message: "Invalid sensor credentials" }); }
+}
+function boundedString(value, max = 256) { return typeof value === "string" ? value.trim().slice(0, max) : ""; }
+function arrayOfStrings(value, maxItems = 32, maxLength = 256) { return Array.isArray(value) ? value.slice(0, maxItems).map((item) => boundedString(item, maxLength)).filter(Boolean) : []; }
+function validObservedAt(value) { const date = new Date(value); return Number.isFinite(date.getTime()) && date.getTime() <= Date.now() + 300_000; }
+function validMac(value) { return !value || /^(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(value); }
+function validIp(value) { return !value || net.isIP(value) > 0; }
+function validateSnapshot(body) {
+  if (!body || typeof body !== "object") return "JSON object required";
+  if (!/^[A-Za-z0-9._:-]{1,120}$/.test(String(body.client_observation_id || ""))) return "client_observation_id is required and must be 1-120 safe characters";
+  if (!validObservedAt(body.observed_at)) return "observed_at must be a valid non-future timestamp";
+  if (!body.connection || typeof body.connection !== "object") return "connection is required";
+  if (!validIp(boundedString(body.connection.local_ip, 64)) || !validIp(boundedString(body.connection.gateway, 64))) return "connection IP values must be valid IP addresses";
+  if (!validMac(boundedString(body.connection.bssid, 64))) return "connection BSSID must be a valid MAC address";
+  if (!Array.isArray(body.interfaces) || body.interfaces.length > 64) return "interfaces must be an array with at most 64 entries";
+  if (!Array.isArray(body.devices) || body.devices.length > 2048) return "devices must be an array with at most 2048 entries";
+  for (const item of body.interfaces) if (!item || typeof item !== "object" || !boundedString(item.name, 128) || !validIp(arrayOfStrings(item.local_ips, 16, 64)[0] || "") || !validMac(boundedString(item.mac, 32))) return "each interface must have a name and valid network values";
+  for (const item of body.devices) if (!item || typeof item !== "object" || (!boundedString(item.ip, 64) && !boundedString(item.mac, 32)) || !validIp(boundedString(item.ip, 64)) || !validMac(boundedString(item.mac, 32))) return "each device needs a valid IP or MAC";
+  return null;
+}
+function devicePayload(row) {
+  return {
+    id: String(row.id), sensorId: String(row.sensor_id), sensorName: row.sensor_name || "", ip: row.ip,
+    mac: row.mac, hostname: row.hostname || null, vendor: row.vendor || null, state: row.device_state,
+    services: parseJson(row.services, []), collectionMethods: parseJson(row.collection_methods, []),
+    lastSeen: timestamp(row.observed_at), source: "sensor", isDemo: false,
+  };
+}
+async function persistSnapshot(sensor, body, req) {
+  const validation = validateSnapshot(body);
+  if (validation) return { status: 400, body: { message: validation } };
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query("SELECT id FROM network_snapshots WHERE sensor_id=$1 AND client_observation_id=$2", [sensor.id, body.client_observation_id]);
+    if (existing.rowCount) { await client.query("COMMIT"); return { status: 200, body: { ok: true, duplicate: true, snapshotId: String(existing.rows[0].id) } }; }
+    const connection = body.connection;
+    const observedAt = new Date(body.observed_at).toISOString();
+    const snapshot = await client.query(`INSERT INTO network_snapshots (sensor_id,client_observation_id,observed_at,connection_state,ssid,bssid,local_ip,subnet,gateway,dns,signal,collection_methods,collection_errors) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`, [
+      sensor.id, body.client_observation_id, observedAt, boundedString(connection.state, 32) || "unknown", boundedString(connection.ssid, 128) || null,
+      boundedString(connection.bssid, 64) || null, boundedString(connection.local_ip, 64) || null, boundedString(connection.subnet, 64) || null,
+      boundedString(connection.gateway, 64) || null, JSON.stringify(arrayOfStrings(connection.dns, 16, 128)), JSON.stringify(connection.signal && typeof connection.signal === "object" ? connection.signal : {}),
+      JSON.stringify(arrayOfStrings(body.collection_methods, 32, 128)), JSON.stringify(Array.isArray(body.collection_errors) ? body.collection_errors.slice(0, 32).map((item) => typeof item === "string" ? { message: boundedString(item, 256) } : { method: boundedString(item?.method, 128), message: boundedString(item?.message, 256) }).filter((item) => item.message) : []),
+    ]);
+    const snapshotId = snapshot.rows[0].id;
+    for (const item of body.interfaces) {
+      const name = boundedString(item.name, 128); if (!name) continue;
+      await client.query("INSERT INTO network_interfaces (sensor_id,snapshot_id,name,alias,state,connection_type,mac,local_ips,collection_method,observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (snapshot_id,name) DO NOTHING", [
+        sensor.id, snapshotId, name, boundedString(item.alias, 128), boundedString(item.state, 32) || "unknown", boundedString(item.connection_type, 32) || "unknown", boundedString(item.mac, 32), JSON.stringify(arrayOfStrings(item.local_ips, 16, 64)), boundedString(item.collection_method, 128), observedAt,
+      ]);
+    }
+    const seen = new Set();
+    for (const item of body.devices) {
+      const ip = boundedString(item.ip, 64); const mac = boundedString(item.mac, 32).toLowerCase(); const key = boundedString(item.observation_key, 160) || `${mac}|${ip}`;
+      if (seen.has(key)) continue; seen.add(key);
+      await client.query("INSERT INTO device_observations (sensor_id,snapshot_id,observation_key,ip,mac,hostname,vendor,device_state,services,collection_methods,observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (sensor_id,snapshot_id,observation_key) DO NOTHING", [
+        sensor.id, snapshotId, key, ip, mac, boundedString(item.hostname, 256) || null, boundedString(item.vendor, 128) || null, boundedString(item.state, 32) || "observed",
+        JSON.stringify(Array.isArray(item.services) ? item.services.slice(0, 32).map((service) => ({ port: Number(service?.port) || 0, protocol: boundedString(service?.protocol, 16), available: Boolean(service?.available), method: boundedString(service?.method, 64) })).filter((service) => service.port > 0) : []), JSON.stringify(arrayOfStrings(item.collection_methods, 32, 128)), observedAt,
+      ]);
+    }
+    const errors = Array.isArray(body.collection_errors) ? body.collection_errors : [];
+    await client.query("UPDATE sensors SET last_observation_at=$1,last_heartbeat_at=GREATEST(COALESCE(last_heartbeat_at,$1),$1),last_error_at=$2,last_error=$3,last_ip=$4,hostname=COALESCE(NULLIF($5,''),hostname),sensor_version=COALESCE(NULLIF($6,''),sensor_version) WHERE id=$7", [observedAt, errors.length ? new Date().toISOString() : null, errors.length ? boundedString(errors[0]?.message || errors[0], 256) : null, ipOf(req), boundedString(body.hostname, 256), boundedString(body.sensor_version, 64), sensor.id]);
+    await client.query("COMMIT");
+    return { status: 201, body: { ok: true, duplicate: false, snapshotId: String(snapshotId), devicesAccepted: seen.size } };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    if (error.code === "23505") {
+      const duplicate = await pool.query("SELECT id FROM network_snapshots WHERE sensor_id=$1 AND client_observation_id=$2", [sensor.id, body.client_observation_id]);
+      if (duplicate.rowCount) return { status: 200, body: { ok: true, duplicate: true, snapshotId: String(duplicate.rows[0].id) } };
+    }
+    throw error;
+  } finally { client.release(); }
+}
+
 function alertPayload(row) { return { id: row.id, title: row.title || row.name || "Alert", rule: row.rule || "", ruleId: row.ruleId || row.rule_id || "", severity: row.severity || "info", status: row.status || "new", sourceIp: row.sourceIp || row.source_ip || "", destinationIp: row.destinationIp || row.destination_ip || "", host: row.host || "", user: row.user || row.username || "", mitreTechnique: row.mitreTechnique || row.mitre_technique || "", mitreName: row.mitreName || row.mitre_name || "", tactic: row.tactic || "", assignee: row.assignee || null, timestamp: timestamp(row.timestamp || row.created_at), description: row.description || "", rawEvent: row.rawEvent || row.raw_event || {}, relatedIncidentId: row.relatedIncidentId || row.related_incident_id || null, notes: row.notes || [], timeline: row.timeline || [], riskScore: Number(row.riskScore || row.risk_score || 0) }; }
 function incidentPayload(row) { return { id: row.id, title: row.title || "Incident", severity: row.severity || "info", priority: row.priority || "P4", status: row.status || "open", assignee: row.assignee || null, createdAt: timestamp(row.createdAt || row.created_at), updatedAt: timestamp(row.updatedAt || row.updated_at), affectedAssets: row.affectedAssets || [], alertIds: row.alertIds || [], caseIds: row.caseIds || [], mitre: row.mitre || [], summary: row.summary || "", resolution: row.resolution || null, timeline: row.timeline || [], notes: row.notes || [], evidence: row.evidence || [] }; }
 function sessionPayload(row) { return { id: String(row.id), userId: row.user_id, name: row.name, email: row.email, role: uiRole(row.role), loginAt: timestamp(row.started_at), lastActivity: timestamp(row.last_activity), ip: row.ip, device: row.device, location: row.location, current: row.current }; }
@@ -76,6 +191,58 @@ function listRoute(kind, mapper) { return async (req, res) => res.json((await re
 app.get("/", (req, res) => res.json({ ok: true, message: "SentinelOps backend is running", health: "/health" }));
 app.get("/health", async (req, res) => { try { await pool.query("SELECT 1"); res.json({ ok: true, message: "Backend and database are healthy", email: mailConfiguration().configured ? "configured" : "not_configured" }); } catch { res.status(500).json({ ok: false, error: "Database connection failed" }); } });
 app.get("/health/email", (req, res) => res.json(mailConfiguration()));
+
+/* ---------------------------------------------------------- network sensors */
+app.post("/sensors/enroll", requireAuth, async (req, res) => {
+  if (String(req.headers["x-sentinelops-enrollment"] || "").toLowerCase() !== "powershell") return res.status(403).json({ message: "Sensor enrollment must be performed from the documented PowerShell procedure" });
+  const name = boundedString(req.body?.name, 80); if (!name) return res.status(400).json({ message: "Sensor name is required" });
+  const sensorId = crypto.randomUUID(); const secret = randomToken();
+  const result = await pool.query("INSERT INTO sensors (id,owner_user_id,name,secret_hash,hostname,platform,sensor_version) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *", [sensorId, req.user.id, name, await bcrypt.hash(secret, 12), boundedString(req.body?.hostname, 256), boundedString(req.body?.platform, 32) || "windows", boundedString(req.body?.sensor_version, 64)]);
+  res.setHeader("Cache-Control", "no-store");
+  res.status(201).json({ sensor: publicSensor(result.rows[0]), credentials: { sensorId, secret, apiBaseUrl: `${req.protocol}://${req.get("host")}` } });
+});
+app.get("/sensors", requireAuth, async (req, res) => {
+  const result = req.user.role === "admin" ? await pool.query("SELECT * FROM sensors ORDER BY created_at DESC") : await pool.query("SELECT * FROM sensors WHERE owner_user_id=$1 ORDER BY created_at DESC", [req.user.id]);
+  res.json(result.rows.map(publicSensor));
+});
+app.post("/sensors/:id/revoke", requireAuth, async (req, res) => {
+  const result = await pool.query("SELECT * FROM sensors WHERE id=$1", [req.params.id]);
+  if (!result.rowCount) return res.status(404).json({ message: "Sensor not found" });
+  if (!sensorOwnerCanAccess(req, result.rows[0])) return res.status(403).json({ message: "Sensor access denied" });
+  const revoked = await pool.query("UPDATE sensors SET status='revoked',revoked_at=COALESCE(revoked_at,now()) WHERE id=$1 RETURNING *", [req.params.id]);
+  res.json({ sensor: publicSensor(revoked.rows[0]) });
+});
+app.post("/sensor/v1/heartbeat", requireSensor, async (req, res) => {
+  const errors = Array.isArray(req.body?.collection_errors) ? req.body.collection_errors.slice(0, 32).map((item) => typeof item === "string" ? { message: boundedString(item, 256) } : { method: boundedString(item?.method, 128), message: boundedString(item?.message, 256) }).filter((item) => item.message) : [];
+  const observedAt = req.body?.observed_at && validObservedAt(req.body.observed_at) ? new Date(req.body.observed_at).toISOString() : null;
+  const result = await pool.query("UPDATE sensors SET last_heartbeat_at=now(),last_error_at=$1,last_error=$2,last_ip=$3,hostname=COALESCE(NULLIF($4,''),hostname),platform=COALESCE(NULLIF($5,''),platform),sensor_version=COALESCE(NULLIF($6,''),sensor_version),heartbeat_interval_seconds=GREATEST(15,LEAST($7,3600)) WHERE id=$8 RETURNING *", [errors.length ? new Date().toISOString() : null, errors.length ? errors[0].message : null, ipOf(req), boundedString(req.body?.hostname, 256), boundedString(req.body?.platform, 32), boundedString(req.body?.sensor_version, 64), Number(req.body?.heartbeat_interval_seconds) || 60, req.sensor.id]);
+  res.json({ ok: true, receivedAt: now(), observedAt, sensor: publicSensor(result.rows[0]) });
+});
+app.post("/sensor/v1/snapshots", requireSensor, async (req, res) => {
+  try { const result = await persistSnapshot(req.sensor, req.body, req); return res.status(result.status).json(result.body); }
+  catch (error) { console.error("Sensor snapshot ingestion failed:", error.message); return res.status(500).json({ message: "Unable to persist network snapshot" }); }
+});
+
+async function networkDevices(req, search = "") {
+  const result = await pool.query(`SELECT latest.*,s.name AS sensor_name FROM (SELECT DISTINCT ON (d.sensor_id,d.observation_key) d.* FROM device_observations d ORDER BY d.sensor_id,d.observation_key,d.observed_at DESC) latest JOIN sensors s ON s.id=latest.sensor_id WHERE ${req.user.role === "admin" ? "TRUE" : "s.owner_user_id=$1"} AND ($${req.user.role === "admin" ? 1 : 2}='' OR concat_ws(' ',latest.ip,latest.mac,latest.hostname,latest.vendor) ILIKE $${req.user.role === "admin" ? 2 : 3}) ORDER BY latest.observed_at DESC`, req.user.role === "admin" ? [search, `%${search}%`] : [req.user.id, search, `%${search}%`]);
+  return result.rows.map(devicePayload);
+}
+app.get("/network/devices", requireAuth, async (req, res) => res.json(await networkDevices(req, boundedString(req.query.search, 128))));
+app.get("/network/snapshots", requireAuth, async (req, res) => {
+  const result = await pool.query(`SELECT n.*,s.name AS sensor_name FROM network_snapshots n JOIN sensors s ON s.id=n.sensor_id WHERE ${req.user.role === "admin" ? "TRUE" : "s.owner_user_id=$1"} ORDER BY n.observed_at DESC LIMIT 100`, req.user.role === "admin" ? [] : [req.user.id]);
+  res.json(result.rows.map((row) => ({ id: String(row.id), sensorId: String(row.sensor_id), sensorName: row.sensor_name, observationId: row.client_observation_id, observedAt: timestamp(row.observed_at), connection: { state: row.connection_state, ssid: row.ssid, bssid: row.bssid, localIp: row.local_ip, subnet: row.subnet, gateway: row.gateway, dns: parseJson(row.dns, []), signal: parseJson(row.signal, {}) }, collectionMethods: parseJson(row.collection_methods, []), collectionErrors: parseJson(row.collection_errors, []) })));
+});
+app.get("/network/interfaces", requireAuth, async (req, res) => {
+  const result = await pool.query(`SELECT i.*,s.name AS sensor_name FROM network_interfaces i JOIN sensors s ON s.id=i.sensor_id WHERE ${req.user.role === "admin" ? "TRUE" : "s.owner_user_id=$1"} ORDER BY i.observed_at DESC LIMIT 200`, req.user.role === "admin" ? [] : [req.user.id]);
+  res.json(result.rows.map((row) => ({ id: String(row.id), sensorId: String(row.sensor_id), sensorName: row.sensor_name, snapshotId: String(row.snapshot_id), name: row.name, alias: row.alias, state: row.state, connectionType: row.connection_type, mac: row.mac, localIps: parseJson(row.local_ips, []), collectionMethod: row.collection_method, observedAt: timestamp(row.observed_at) })));
+});
+app.get("/network/overview", requireAuth, async (req, res) => {
+  const sensors = req.user.role === "admin" ? await pool.query("SELECT * FROM sensors ORDER BY created_at DESC") : await pool.query("SELECT * FROM sensors WHERE owner_user_id=$1 ORDER BY created_at DESC", [req.user.id]);
+  const devices = await networkDevices(req);
+  const snapshots = await pool.query(`SELECT latest.*,s.name AS sensor_name FROM (SELECT DISTINCT ON (n.sensor_id) n.* FROM network_snapshots n ORDER BY n.sensor_id,n.observed_at DESC) latest JOIN sensors s ON s.id=latest.sensor_id WHERE ${req.user.role === "admin" ? "TRUE" : "s.owner_user_id=$1"}`, req.user.role === "admin" ? [] : [req.user.id]);
+  const latestSnapshots = snapshots.rows.map((row) => ({ id: String(row.id), sensorId: String(row.sensor_id), sensorName: row.sensor_name, observationId: row.client_observation_id, observedAt: timestamp(row.observed_at), connection: { state: row.connection_state, ssid: row.ssid, bssid: row.bssid, localIp: row.local_ip, subnet: row.subnet, gateway: row.gateway, dns: parseJson(row.dns, []), signal: parseJson(row.signal, {}) }, collectionMethods: parseJson(row.collection_methods, []), collectionErrors: parseJson(row.collection_errors, []) }));
+  res.json({ sensors: sensors.rows.map(publicSensor), devices, latestSnapshots, sensorCount: sensors.rowCount, activeSensorCount: sensors.rows.filter((row) => sensorStatus(row) === "active").length });
+});
 
 app.post("/auth/register", async (req, res) => {
   const name = String(req.body?.name || "").trim(); const email = String(req.body?.email || "").trim().toLowerCase(); const password = String(req.body?.password || "");
@@ -118,7 +285,19 @@ app.get("/iocs/:id", requireAuth, async (req, res) => { const row = await record
 app.post("/iocs", requireAuth, async (req, res) => { const id = `IOC-${Date.now()}`; const riskScore = Number(req.body?.riskScore || 0); const item = await putRecord("ioc", id, { id, type: req.body?.type || "ip", value: req.body?.value || "", riskScore, severity: riskScore > 85 ? "critical" : riskScore > 65 ? "high" : riskScore > 45 ? "medium" : "low", tags: req.body?.tags || [], source: req.body?.source || "Internal Analysis", firstSeen: now(), lastSeen: now(), matches: 0, relatedAlertIds: [], relatedIncidentIds: [], description: "Indicator created by an authenticated analyst." }); await notifyUsers({ title: "IOC created", body: `${id} was added to IOC management`, severity: item.severity, category: "ioc_match", link: "/ioc", eventKey: `ioc-create:${id}` }); broadcast({ id: `ioc-${id}`, at: now(), kind: "ioc", severity: item.severity, message: "IOC created", detail: item.value }); res.status(201).json(item); });
 app.delete("/iocs/:id", requireAuth, async (req, res) => { const result = await pool.query("DELETE FROM soc_records WHERE kind='ioc' AND id=$1 RETURNING id", [req.params.id]); if (!result.rowCount) return res.status(404).json({ message: "Indicator not found" }); res.json({ ok: true }); });
 
-app.get("/assets", requireAuth, listRoute("asset"));
+app.get("/assets", requireAuth, async (req, res) => {
+  const existing = (await records("asset", String(req.query.search || ""))).map((item) => ({ ...item, source: item.source || "soc", isDemo: Boolean(item.isDemo) }));
+  const devices = await networkDevices(req, boundedString(req.query.search, 128));
+  const observedAssets = devices.map((device) => ({
+    id: `network-${device.sensorId}-${device.ip || device.mac}`,
+    name: device.hostname || device.ip || device.mac || "Observed network device",
+    type: "endpoint", os: "unavailable", ip: device.ip, owner: "unavailable", criticality: "low", riskScore: 0,
+    patchStatus: "pending", lastSeen: device.lastSeen, software: [], alertIds: [], incidentIds: [], tags: ["network-observation"],
+    source: "sensor", isDemo: false, sensorId: device.sensorId, sensorName: device.sensorName, mac: device.mac, vendor: device.vendor,
+    collectionMethods: device.collectionMethods, services: device.services,
+  }));
+  res.json([...observedAssets, ...existing]);
+});
 app.get("/assets/:id", requireAuth, async (req, res) => { const row = await record("asset", req.params.id); if (!row) return res.status(404).json({ message: "Asset not found" }); res.json(parseJson(row.payload, { id: row.id })); });
 app.get("/rules", requireAuth, listRoute("rule"));
 app.patch("/rules/:id", requireAuth, requireManager, async (req, res) => { const updated = await patchRecord("rule", req.params.id, { enabled: Boolean(req.body?.enabled), updatedAt: now() }); if (!updated) return res.status(404).json({ message: "Detection rule not found" }); await audit(req.user, updated.enabled ? "rule.enable" : "rule.disable", `rules/${req.params.id}`, req); res.json([updated]); });

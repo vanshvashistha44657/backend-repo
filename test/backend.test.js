@@ -130,6 +130,35 @@ test("authenticated websocket connections receive server events", async () => {
   }
 });
 
+test("sensor enrollment authenticates, persists idempotent telemetry, and reports stale state", async () => {
+  const login = await request(app).post("/auth/login").send({ email: testUser.email, password: resetPassword }).expect(200);
+  const auth = { Authorization: `Bearer ${login.body.token}` };
+  await request(app).post("/sensors/enroll").set(auth).send({ name: "Browser-like attempt" }).expect(403);
+  const enrollment = await request(app).post("/sensors/enroll").set({ ...auth, "X-SentinelOps-Enrollment": "powershell" }).send({ name: "Isolated Windows Sensor", hostname: "TEST-WIN", platform: "windows", sensor_version: "test" }).expect(201);
+  const sensor = enrollment.body.sensor;
+  const credentials = enrollment.body.credentials;
+  assert.equal(sensor.status, "never_reported");
+  const secretHash = await pool.query("SELECT secret_hash FROM sensors WHERE id=$1", [sensor.id]);
+  assert.notEqual(secretHash.rows[0].secret_hash, credentials.secret);
+  const sensorHeaders = { "X-Sensor-ID": credentials.sensorId, "X-Sensor-Secret": credentials.secret };
+  const heartbeat = await request(app).post("/sensor/v1/heartbeat").set(sensorHeaders).send({ hostname: "TEST-WIN", platform: "windows", sensor_version: "test", heartbeat_interval_seconds: 30, observed_at: new Date().toISOString(), collection_errors: [] }).expect(200);
+  assert.equal(heartbeat.body.sensor.status, "active");
+  const snapshot = { client_observation_id: "test-observation-1", observed_at: new Date().toISOString(), hostname: "TEST-WIN", sensor_version: "test", connection: { state: "connected", ssid: "Authorized-Test-WiFi", bssid: "aa-bb-cc-dd-ee-ff", local_ip: "192.0.2.10", subnet: "192.0.2.0/24", gateway: "192.0.2.1", dns: ["192.0.2.1"], signal: { percent: 82 } }, interfaces: [{ name: "Wi-Fi", alias: "Wi-Fi", state: "Up", connection_type: "802.11", mac: "aa-bb-cc-dd-ee-ff", local_ips: ["192.0.2.10"], collection_method: "test" }], devices: [{ ip: "192.0.2.20", mac: "11-22-33-44-55-66", hostname: "observed-host", vendor: null, state: "Reachable", services: [{ port: 443, protocol: "tcp", available: true, method: "test" }], collection_methods: ["test"] }], collection_methods: ["test"], collection_errors: [] };
+  const inserted = await request(app).post("/sensor/v1/snapshots").set(sensorHeaders).send(snapshot).expect(201);
+  assert.equal(inserted.body.devicesAccepted, 1);
+  const duplicate = await request(app).post("/sensor/v1/snapshots").set(sensorHeaders).send(snapshot).expect(200);
+  assert.equal(duplicate.body.duplicate, true);
+  const devices = await request(app).get("/network/devices").set(auth).expect(200);
+  assert.equal(devices.body[0].ip, "192.0.2.20");
+  const assets = await request(app).get("/assets").set(auth).expect(200);
+  assert.equal(assets.body[0].source, "sensor");
+  await pool.query("UPDATE sensors SET last_heartbeat_at=now()-interval '10 minutes' WHERE id=$1", [sensor.id]);
+  const stale = await request(app).get("/sensors").set(auth).expect(200);
+  assert.equal(stale.body.find((item) => item.id === sensor.id).status, "stale");
+  await request(app).post(`/sensors/${sensor.id}/revoke`).set(auth).expect(200);
+  await request(app).post("/sensor/v1/heartbeat").set(sensorHeaders).send({}).expect(401);
+});
+
 test("demo seed is repeatable and refuses production mode", () => {
   const seed = path.join(__dirname, "..", "scripts", "seed-demo.js");
   const env = { ...process.env, NODE_ENV: "test", ALLOW_DEMO_SEED: "true", DEMO_SEED_PASSWORD: demoSeedPassword };
