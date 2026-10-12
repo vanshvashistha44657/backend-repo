@@ -164,6 +164,112 @@ test("sensor enrollment authenticates, persists idempotent telemetry, and report
   await request(app).post("/sensor/v1/heartbeat").set(sensorHeaders).send({}).expect(401);
 });
 
+test("two-user network privacy isolates sensors, telemetry, alerts, notifications, and WebSockets", async () => {
+  const aPassword = "IsolatedUserAPassword123!";
+  const bPassword = "IsolatedUserBPassword123!";
+  const managerPassword = "IsolatedManagerPassword123!";
+  const bHash = await bcrypt.hash(bPassword, 4);
+  const managerHash = await bcrypt.hash(managerPassword, 4);
+  const aHash = await bcrypt.hash(aPassword, 4);
+  const aUser = (await pool.query("INSERT INTO users(name,email,password_hash,role,approved) VALUES($1,$2,$3,'user',true) RETURNING *", ["Isolated User A", "isolated-user-a@example.test", aHash])).rows[0];
+  const bUser = (await pool.query("INSERT INTO users(name,email,password_hash,role,approved) VALUES($1,$2,$3,'user',true) RETURNING *", ["Isolated User B", "isolated-user-b@example.test", bHash])).rows[0];
+  const manager = (await pool.query("INSERT INTO users(name,email,password_hash,role,approved) VALUES($1,$2,$3,'manager',true) RETURNING *", ["Isolated Manager", "isolated-manager@example.test", managerHash])).rows[0];
+  const loginA = await request(app).post("/auth/login").send({ email: aUser.email, password: aPassword }).expect(200);
+  const loginB = await request(app).post("/auth/login").send({ email: bUser.email, password: bPassword }).expect(200);
+  const loginAdmin = await request(app).post("/auth/login").send({ email: testUser.email, password: resetPassword }).expect(200);
+  const loginManager = await request(app).post("/auth/login").send({ email: manager.email, password: managerPassword }).expect(200);
+  const authA = { Authorization: `Bearer ${loginA.body.token}` };
+  const authB = { Authorization: `Bearer ${loginB.body.token}` };
+  const authAdmin = { Authorization: `Bearer ${loginAdmin.body.token}` };
+  const authManager = { Authorization: `Bearer ${loginManager.body.token}` };
+  const enroll = async (auth, name, ownerUserId) => {
+    await request(app).post("/sensors/enroll").set({ ...auth, "X-SentinelOps-Enrollment": "powershell", "Sec-Fetch-Mode": "cors" }).send({ name }).expect(403);
+    const response = await request(app).post("/sensors/enroll").set({ ...auth, "X-SentinelOps-Enrollment": "powershell" }).send({ name, hostname: name, platform: "windows", sensor_version: "isolation-test", owner_user_id: ownerUserId }).expect(201);
+    assert.equal(Object.prototype.hasOwnProperty.call(response.body.credentials, "secret"), true);
+    assert.equal(Object.prototype.hasOwnProperty.call(response.body.sensor, "secret"), false);
+    return { sensor: response.body.sensor, headers: { "X-Sensor-ID": response.body.credentials.sensorId, "X-Sensor-Secret": response.body.credentials.secret } };
+  };
+  const sensorA = await enroll(authA, "Sensor-A", bUser.id);
+  const sensorB = await enroll(authB, "Sensor-B", testUser.id);
+  const owners = await pool.query("SELECT id,owner_user_id FROM sensors WHERE id IN($1,$2) ORDER BY id", [sensorA.sensor.id, sensorB.sensor.id]);
+  assert.equal(String(owners.rows.find((row) => String(row.id) === sensorA.sensor.id).owner_user_id), String(aUser.id));
+  assert.equal(String(owners.rows.find((row) => String(row.id) === sensorB.sensor.id).owner_user_id), String(bUser.id));
+
+  const snapshot = (id, ssid, ip, deviceIp) => ({ client_observation_id: id, observed_at: new Date().toISOString(), hostname: id, sensor_version: "isolation-test", connection: { state: "connected", ssid, bssid: "aa-bb-cc-dd-ee-ff", local_ip: ip, subnet: "192.0.2.0/24", gateway: "192.0.2.1", dns: ["192.0.2.1"], signal: { percent: 80 } }, interfaces: [{ name: "Wi-Fi", state: "Up", connection_type: "802.11", mac: "aa-bb-cc-dd-ee-ff", local_ips: [ip], collection_method: "isolation-test" }], devices: [{ ip: deviceIp, mac: id === "b-1" ? "bb-bb-bb-bb-bb-bb" : "aa-aa-aa-aa-aa-aa", hostname: `${id}.local`, state: "observed", services: [], collection_methods: ["isolation-test"] }], collection_methods: ["isolation-test"], collection_errors: [] });
+  await request(app).post("/sensor/v1/snapshots").set(sensorA.headers).send(snapshot("a-1", "WiFi-A", "192.0.2.10", "192.0.2.20")).expect(201);
+  await request(app).post("/sensor/v1/snapshots").set(sensorB.headers).send(snapshot("b-1", "WiFi-B", "198.51.100.10", "198.51.100.20")).expect(201);
+  const bChanged = snapshot("b-2", "WiFi-B-Changed", "198.51.100.10", "198.51.100.20");
+  const bChangedResult = await request(app).post("/sensor/v1/snapshots").set(sensorB.headers).send(bChanged).expect(201);
+  assert.match(bChangedResult.body.alertId, /^network-change-/);
+
+  const aSensors = await request(app).get("/sensors").set(authA).expect(200);
+  const bSensors = await request(app).get("/sensors").set(authB).expect(200);
+  assert.deepEqual(aSensors.body.map((item) => item.id), [sensorA.sensor.id]);
+  assert.deepEqual(bSensors.body.map((item) => item.id), [sensorB.sensor.id]);
+  assert.equal((await request(app).get("/sensors").set(authManager).expect(200)).body.length, 0);
+  assert.equal((await request(app).get("/sensors").set(authA).expect(200)).body[0].secret, undefined);
+
+  const aOverview = await request(app).get("/network/overview").set(authA).expect(200);
+  const bOverview = await request(app).get("/network/overview").set(authB).expect(200);
+  assert.equal(aOverview.body.latestSnapshots[0].connection.ssid, "WiFi-A");
+  assert.equal(aOverview.body.devices[0].ip, "192.0.2.20");
+  assert.equal(bOverview.body.latestSnapshots[0].connection.ssid, "WiFi-B-Changed");
+  assert.equal(bOverview.body.devices[0].ip, "198.51.100.20");
+  assert.equal(JSON.stringify(aOverview.body).includes("WiFi-B"), false);
+  assert.equal(JSON.stringify(bOverview.body).includes("WiFi-A"), false);
+  assert.equal((await request(app).get("/network/snapshots").set(authA).expect(200)).body.every((item) => item.connection.ssid !== "WiFi-B"), true);
+  assert.equal((await request(app).get("/network/interfaces").set(authB).expect(200)).body.every((item) => item.sensorId === sensorB.sensor.id), true);
+
+  const sockets = await require("../server").start(0);
+  const aEvents = []; const bEvents = [];
+  let socketA; let socketB;
+  try {
+    const address = sockets.address();
+    socketA = new WebSocket(`ws://127.0.0.1:${address.port}/ws?token=${encodeURIComponent(loginA.body.token)}`);
+    socketB = new WebSocket(`ws://127.0.0.1:${address.port}/ws?token=${encodeURIComponent(loginB.body.token)}`);
+    socketA.on("message", (value) => aEvents.push(JSON.parse(value.toString())));
+    socketB.on("message", (value) => bEvents.push(JSON.parse(value.toString())));
+    await Promise.all([new Promise((resolve, reject) => { socketA.once("open", resolve); socketA.once("error", reject); }), new Promise((resolve, reject) => { socketB.once("open", resolve); socketB.once("error", reject); })]);
+    const changed = snapshot("a-2", "WiFi-A-Changed", "192.0.2.10", "192.0.2.20");
+    const changedResult = await request(app).post("/sensor/v1/snapshots").set(sensorA.headers).send(changed).expect(201);
+    assert.match(changedResult.body.alertId, /^network-change-/);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(aEvents.some((event) => event.kind === "alert" && event.detail === "Sensor-A"), true);
+    assert.equal(bEvents.some((event) => event.kind === "alert" && event.detail === "Sensor-A"), false);
+  } finally {
+    socketA?.close(); socketB?.close();
+    await new Promise((resolve) => sockets.close(resolve));
+  }
+
+  const aAlerts = await request(app).get("/alerts").set(authA).expect(200);
+  const bAlerts = await request(app).get("/alerts").set(authB).expect(200);
+  const bAlert = bAlerts.body.items.find((item) => item.ruleId === "network-context-change");
+  assert.equal(aAlerts.body.items.some((item) => item.id === bAlert?.id), false);
+  assert.equal((await request(app).get(`/alerts/${bAlert.id}`).set(authA)).status, 404);
+  assert.equal((await request(app).patch(`/alerts/${bAlert.id}`).set(authA).send({ description: "cross-user" })).status, 404);
+  assert.equal((await request(app).post(`/sensors/${sensorB.sensor.id}/revoke`).set(authA)).status, 403);
+  assert.equal((await request(app).post(`/sensors/${sensorA.sensor.id}/revoke`).set(authB)).status, 403);
+
+  const aNotifications = await request(app).get("/notifications").set(authA).expect(200);
+  const bNotifications = await request(app).get("/notifications").set(authB).expect(200);
+  assert.equal(aNotifications.body.some((item) => item.title === "Network context changed" && item.body.includes("Sensor-A")), true);
+  assert.equal(bNotifications.body.some((item) => item.title === "Network context changed" && item.body.includes("Sensor-B")), true);
+  assert.equal(bNotifications.body.some((item) => item.body.includes("Sensor-A")), false);
+  const aNotificationId = aNotifications.body.find((item) => item.title === "Network context changed").id;
+  assert.equal((await request(app).post(`/notifications/${aNotificationId}/read`).set(authB)).status, 404);
+  assert.equal((await request(app).get("/network/overview").set(authManager).expect(200)).body.devices.length, 0);
+  const adminSensors = await request(app).get("/sensors").set(authAdmin).expect(200);
+  assert.equal(adminSensors.body.some((item) => item.id === sensorA.sensor.id), true);
+  assert.equal(adminSensors.body.some((item) => item.id === sensorB.sensor.id), true);
+
+  await request(app).post(`/sensors/${sensorB.sensor.id}/revoke`).set(authB).expect(200);
+  await request(app).post("/sensor/v1/heartbeat").set(sensorB.headers).send({}).expect(401);
+
+  const bSessions = await request(app).get("/auth/sessions").set(authB).expect(200);
+  await pool.query("UPDATE sessions SET status='revoked',revoked_at=now() WHERE id=$1", [bSessions.body[0].id]);
+  assert.equal((await request(app).get("/network/overview").set(authB)).status, 401);
+});
+
 test("demo seed is repeatable and refuses production mode", () => {
   const seed = path.join(__dirname, "..", "scripts", "seed-demo.js");
   const env = { ...process.env, NODE_ENV: "test", ALLOW_DEMO_SEED: "true", DEMO_SEED_PASSWORD: demoSeedPassword };
