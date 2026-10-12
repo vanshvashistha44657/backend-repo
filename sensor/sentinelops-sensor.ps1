@@ -8,7 +8,8 @@ param(
   [int[]]$ServicePorts = @(),
   [ValidateRange(15, 3600)][int]$IntervalSeconds = 60,
   [ValidateRange(1, 1024)][int]$MaxHosts = 254,
-  [string]$PidPath = "$env:ProgramData\SentinelOps\sensor.pid",
+  [string]$PidPath = "$env:LOCALAPPDATA\SentinelOps\sensor.pid",
+  [ValidateRange(1, 8)][int]$MaxRetries = 5,
   [switch]$AllowInsecureLocal,
   [switch]$Once
 )
@@ -142,14 +143,56 @@ function Get-NeighbourDevices([System.Collections.Generic.List[object]]$Errors, 
   return @($result.ToArray())
 }
 
-function Send-SensorJson([hashtable]$Config, [string]$Path, [object]$Payload, [hashtable]$Headers) {
+function Get-SafeErrorMessage([System.Management.Automation.ErrorRecord]$ErrorRecord) {
+  $response = $ErrorRecord.Exception.Response
+  if ($response) {
+    $status = try { [int]$response.StatusCode } catch { 0 }
+    $body = [string]$ErrorRecord.ErrorDetails.Message
+    try { $reader = New-Object IO.StreamReader($response.GetResponseStream()); $body = $reader.ReadToEnd() } catch { }
+    if (!$body) { $body = [string]$ErrorRecord.ErrorDetails.Message }
+    $body = [regex]::Replace($body, '(?i)(sensor[_-]?secret|password|token|authorization)\s*[:=]\s*["'']?[^,"''}\s]+', '$1=[redacted]')
+    $body = [regex]::Replace($body, '\s+', ' ').Trim()
+    if ($body.Length -gt 240) { $body = $body.Substring(0, 240) }
+    if ($body) { return "HTTP ${status}: $body" }
+    return "HTTP $status"
+  }
+  $message = [string]$ErrorRecord.Exception.Message
+  if ($message.Length -gt 240) { $message = $message.Substring(0, 240) }
+  return "transport: $message"
+}
+
+function Get-ErrorStatus([System.Management.Automation.ErrorRecord]$ErrorRecord) {
+  try { return [int]$ErrorRecord.Exception.Response.StatusCode } catch { return 0 }
+}
+
+function Test-RetryableFailure([System.Management.Automation.ErrorRecord]$ErrorRecord) {
+  $status = Get-ErrorStatus $ErrorRecord
+  return $status -eq 0 -or $status -in @(408, 425, 429, 500, 502, 503, 504)
+}
+
+function Send-SensorJson([hashtable]$Config, [string]$Path, [object]$Payload, [hashtable]$Headers, [int]$Retries) {
   $json = $Payload | ConvertTo-Json -Depth 12 -Compress
-  return Invoke-RestMethod -Method Post -Uri "$($Config.ApiBaseUrl)$Path" -Headers $Headers -ContentType "application/json" -Body $json -TimeoutSec 60
+  $uri = "$($Config.ApiBaseUrl)$Path"
+  for ($attempt = 1; $attempt -le $Retries; $attempt++) {
+    try {
+      $response = Invoke-WebRequest -Method Post -Uri $uri -Headers $Headers -ContentType "application/json" -Body $json -TimeoutSec 60 -UseBasicParsing
+      if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) { throw [System.Net.WebException]::new("HTTP $($response.StatusCode)") }
+      try { return ($response.Content | ConvertFrom-Json) } catch { throw "HTTP $($response.StatusCode) returned invalid JSON" }
+    } catch {
+      $safe = Get-SafeErrorMessage $_
+      if (!(Test-RetryableFailure $_) -or $attempt -eq $Retries) { throw "request $Path failed after $attempt attempt(s): $safe" }
+      $delay = [Math]::Min(30, [int]([Math]::Pow(2, $attempt - 1) * 2) + (Get-Random -Minimum 0 -Maximum 2))
+      Write-Warning ("request {0} attempt {1}/{2} failed: {3}; retrying in {4}s" -f $Path, $attempt, $Retries, $safe, $delay)
+      Start-Sleep -Seconds $delay
+    }
+  }
 }
 
 $config = Get-Config
 $directory = Split-Path -Parent $ConfigPath
 if (!(Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+$pidDirectory = Split-Path -Parent $PidPath
+if (!(Test-Path -LiteralPath $pidDirectory)) { New-Item -ItemType Directory -Path $pidDirectory -Force | Out-Null }
 Set-Content -LiteralPath $PidPath -Value $PID -Encoding ascii
 $headers = @{ "X-Sensor-ID" = $config.SensorId; "X-Sensor-Secret" = $config.SensorSecret; "User-Agent" = "SentinelOps-Windows-Sensor/1.0" }
 try {
@@ -162,12 +205,12 @@ try {
       $errorArray = @($errors.ToArray())
       $heartbeat = @{}
       $heartbeat["observed_at"] = $observedAt; $heartbeat["hostname"] = $env:COMPUTERNAME; $heartbeat["platform"] = "windows"; $heartbeat["sensor_version"] = "1.0"; $heartbeat["heartbeat_interval_seconds"] = $IntervalSeconds; $heartbeat["collection_errors"] = $errorArray
-      Send-SensorJson $config "/sensor/v1/heartbeat" $heartbeat $headers | Out-Null
+      Send-SensorJson $config "/sensor/v1/heartbeat" $heartbeat $headers $MaxRetries | Out-Null
       $snapshot = @{}
       $snapshot["client_observation_id"] = [guid]::NewGuid().ToString(); $snapshot["observed_at"] = $observedAt; $snapshot["hostname"] = $env:COMPUTERNAME; $snapshot["platform"] = "windows"; $snapshot["sensor_version"] = "1.0"; $snapshot["connection"] = $network.connection; $snapshot["interfaces"] = $network.interfaces; $snapshot["devices"] = $devices; $snapshot["collection_methods"] = @("Get-NetIPConfiguration", "Get-NetAdapter", "Get-NetNeighbor", "netsh wlan show interfaces"); $snapshot["collection_errors"] = $errorArray
-      $result = Send-SensorJson $config "/sensor/v1/snapshots" $snapshot $headers
+      $result = Send-SensorJson $config "/sensor/v1/snapshots" $snapshot $headers $MaxRetries
       Write-Host ("{0} snapshot={1} devices={2} errors={3}" -f (Get-Date).ToUniversalTime().ToString("o"), $result.snapshotId, $result.devicesAccepted, $errors.Count)
-    } catch { Write-Warning ("Sensor collection/ingestion failed: " + $_.Exception.Message) }
+    } catch { Write-Warning ("Sensor collection/ingestion failed: " + [string]$_.Exception.Message) }
     if (!$Once) { Start-Sleep -Seconds $IntervalSeconds }
   } while (!$Once)
 } finally {
