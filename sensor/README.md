@@ -1,10 +1,12 @@
 # SentinelOps Windows sensor
 
-This read-only PowerShell sensor reports observations from a Windows laptop to the SentinelOps backend. Use it only on a network and devices you own or are explicitly authorized to monitor. It does not capture packet payloads, credentials, or Wi-Fi keys. ARP/neighbour collection is the default; subnet discovery and TCP checks are opt-in, bounded, and rate-limited.
+This read-only PowerShell sensor reports observations from one Windows laptop to the SentinelOps backend. Use it only on a network and devices you own or are explicitly authorized to monitor. It does not capture packet payloads, credentials, or Wi-Fi keys. ARP/neighbour collection is the default; subnet discovery and TCP checks are opt-in, bounded, and rate-limited.
+
+Each enrollment belongs to the authenticated SentinelOps user who performs it. The backend never accepts an owner ID from the sensor or browser. A normal user can list and revoke only their own sensor, and can read only that sensor's SSID, BSSID, local addresses, gateway, interfaces, devices, errors, alerts, and notifications. Administrators can review cross-user sensor data through the existing administrator RBAC path. Logging out or revoking a browser session blocks protected website/API reads; revoking the sensor immediately blocks telemetry credentials. To stop collection, stop the PowerShell process and revoke the sensor with `POST /sensors/:id/revoke` using the owner's authenticated session. The sensor secret is returned once at enrollment, stored locally with Windows DPAPI, and is never included in normal browser responses or sensor status listings.
 
 ## Enroll without exposing a secret in the website
 
-Enrollment is a one-time API operation from an administrator's protected PowerShell session. The website does not list or fetch sensor secrets. Replace the placeholders with a short-lived access token obtained through the normal SentinelOps login flow:
+Enrollment is a one-time API operation from the owning user's protected PowerShell session. The website does not list or fetch sensor secrets. Replace the placeholders with a short-lived access token obtained through the normal SentinelOps login flow:
 
 ```powershell
 $api = "https://your-backend.example.com"
