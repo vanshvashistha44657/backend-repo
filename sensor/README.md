@@ -34,13 +34,15 @@ From the checkout containing this file:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\sensor\sentinelops-sensor.ps1 -ConfigPath "$env:ProgramData\SentinelOps\sensor.json"
 ```
 
-The process writes its PID to `C:\ProgramData\SentinelOps\sensor.pid`. To run in the background and stop it:
+The process writes its PID to `$env:LOCALAPPDATA\SentinelOps\sensor.pid` by default, so a normal user can start it without administrator permissions. To run in the background and stop it:
 
 ```powershell
 Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"$PWD\sensor\sentinelops-sensor.ps1",'-ConfigPath',"$env:ProgramData\SentinelOps\sensor.json" -WindowStyle Hidden
-$pid = Get-Content "$env:ProgramData\SentinelOps\sensor.pid"
+$pid = Get-Content "$env:LOCALAPPDATA\SentinelOps\sensor.pid"
 Stop-Process -Id ([int]$pid)
 ```
+
+Each heartbeat and snapshot request retries transient transport/HTTP failures up to five times with bounded exponential backoff. Diagnostics report only the request path, attempt, HTTP status, and sanitized response message; sensor IDs, secrets, tokens, passwords, and headers are never printed. Use `-MaxRetries 1` only for a one-shot troubleshooting run.
 
 For a single report, add `-Once`. The default `-DiscoveryMode arp` reads only the local neighbour table. To explicitly probe an authorized subnet, provide a bounded CIDR; this sends one low-rate ICMP probe per address:
 
