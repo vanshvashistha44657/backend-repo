@@ -148,8 +148,13 @@ test("sensor enrollment authenticates, persists idempotent telemetry, and report
   assert.equal(inserted.body.devicesAccepted, 1);
   const duplicate = await request(app).post("/sensor/v1/snapshots").set(sensorHeaders).send(snapshot).expect(200);
   assert.equal(duplicate.body.duplicate, true);
+  const changed = { ...snapshot, client_observation_id: "test-observation-2", observed_at: new Date().toISOString(), connection: { ...snapshot.connection, ssid: "Authorized-Test-WiFi-Changed" } };
+  const changedResult = await request(app).post("/sensor/v1/snapshots").set(sensorHeaders).send(changed).expect(201);
+  assert.match(changedResult.body.alertId, /^network-change-/);
   const devices = await request(app).get("/network/devices").set(auth).expect(200);
   assert.equal(devices.body[0].ip, "192.0.2.20");
+  const alerts = await request(app).get("/alerts").set(auth).expect(200);
+  assert.equal(alerts.body.items[0].ruleId, "network-context-change");
   const assets = await request(app).get("/assets").set(auth).expect(200);
   assert.equal(assets.body[0].source, "sensor");
   await pool.query("UPDATE sensors SET last_heartbeat_at=now()-interval '10 minutes' WHERE id=$1", [sensor.id]);

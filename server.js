@@ -144,6 +144,8 @@ async function persistSnapshot(sensor, body, req) {
     await client.query("BEGIN");
     const existing = await client.query("SELECT id FROM network_snapshots WHERE sensor_id=$1 AND client_observation_id=$2", [sensor.id, body.client_observation_id]);
     if (existing.rowCount) { await client.query("COMMIT"); return { status: 200, body: { ok: true, duplicate: true, snapshotId: String(existing.rows[0].id) } }; }
+    const previousResult = await client.query("SELECT observed_at,ssid,bssid,local_ip,subnet,gateway FROM network_snapshots WHERE sensor_id=$1 ORDER BY observed_at DESC LIMIT 1", [sensor.id]);
+    const previous = previousResult.rows[0] || null;
     const connection = body.connection;
     const observedAt = new Date(body.observed_at).toISOString();
     const snapshot = await client.query(`INSERT INTO network_snapshots (sensor_id,client_observation_id,observed_at,connection_state,ssid,bssid,local_ip,subnet,gateway,dns,signal,collection_methods,collection_errors) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`, [
@@ -171,7 +173,23 @@ async function persistSnapshot(sensor, body, req) {
     const errors = Array.isArray(body.collection_errors) ? body.collection_errors : [];
     await client.query("UPDATE sensors SET last_observation_at=$1,last_heartbeat_at=GREATEST(COALESCE(last_heartbeat_at,$1),$1),last_error_at=$2,last_error=$3,last_ip=$4,hostname=COALESCE(NULLIF($5,''),hostname),sensor_version=COALESCE(NULLIF($6,''),sensor_version) WHERE id=$7", [observedAt, errors.length ? new Date().toISOString() : null, errors.length ? boundedString(errors[0]?.message || errors[0], 256) : null, ipOf(req), boundedString(body.hostname, 256), boundedString(body.sensor_version, 64), sensor.id]);
     await client.query("COMMIT");
-    return { status: 201, body: { ok: true, duplicate: false, snapshotId: String(snapshotId), devicesAccepted: seen.size } };
+    let alertId = null;
+    const changed = previous && ["ssid", "bssid", "local_ip", "subnet", "gateway"].some((key) => String(previous[key] || "") !== String(connection[key] || ""));
+    if (changed) {
+      alertId = `network-change-${sensor.id}-${body.client_observation_id}`;
+      const currentFacts = { ssid: connection.ssid || null, bssid: connection.bssid || null, localIp: connection.local_ip || null, subnet: connection.subnet || null, gateway: connection.gateway || null };
+      await putRecord("alert", alertId, {
+        id: alertId, title: "Observed network context changed", rule: "Network Context Change", ruleId: "network-context-change",
+        severity: "info", status: "new", sourceIp: "", destinationIp: "", host: boundedString(body.hostname, 256), user: "",
+        mitreTechnique: "", mitreName: "", tactic: "", assignee: null, timestamp: observedAt,
+        description: "The sensor observed a change in SSID, BSSID, local address, subnet, or gateway. This is an observation for review, not a claim of malicious activity.",
+        rawEvent: { source: "SentinelOps Windows sensor", collectionMethods: body.collection_methods || [], previousFacts: previous, currentFacts },
+        relatedIncidentId: null, notes: [], timeline: [], riskScore: 0,
+      }, { ownerUserId: sensor.owner_user_id });
+      await notify(sensor.owner_user_id, { title: "Network context changed", body: `Sensor ${sensor.name} reported a changed local network context.`, severity: "info", category: "system", link: "/alerts", eventKey: `network-context-change:${sensor.id}:${body.client_observation_id}` });
+      broadcast({ id: alertId, at: observedAt, kind: "alert", severity: "info", message: "Observed network context changed", detail: sensor.name });
+    }
+    return { status: 201, body: { ok: true, duplicate: false, snapshotId: String(snapshotId), devicesAccepted: seen.size, alertId } };
   } catch (error) {
     await client.query("ROLLBACK");
     if (error.code === "23505") {

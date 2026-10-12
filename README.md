@@ -32,6 +32,9 @@ Before production launch, set it to your real frontend origin.
 - Rotating refresh sessions with heartbeat, logout and administrative revocation
 - Authenticated WebSocket endpoint at `/ws?token=<access-token>`
 - Persistent API contract for alerts, incidents, cases, IOCs, assets, rules, intelligence, hunting and reports
+- Read-only Windows network sensor enrollment, heartbeat, interface snapshots and device observations
+- Hashed, revocable per-sensor credentials; sensor secrets are returned only by the documented PowerShell enrollment flow
+- Sensor staleness, collection errors, deduplicated snapshots and observed network-context-change alerts
 
 ## Demo data safety
 
@@ -102,6 +105,21 @@ PATCH /admin/users/:id/approve
 
 Health:
 GET /health
+
+## Windows network sensor
+
+The cloud website cannot inspect a laptop's Wi-Fi adapter or local LAN. Run the documented PowerShell sensor from `sensor/README.md` on the authorized Windows laptop.
+
+The flow is:
+
+1. An administrator obtains a normal SentinelOps access token and runs `POST /sensors/enroll` from PowerShell with `X-SentinelOps-Enrollment: powershell`. The response contains the sensor secret once.
+2. The operator stores the secret in the DPAPI-protected `ProgramData\SentinelOps\sensor.json` file using the commands in `sensor/README.md`.
+3. The sensor sends HTTPS `POST /sensor/v1/heartbeat` and `POST /sensor/v1/snapshots` using `X-Sensor-ID` and `X-Sensor-Secret` headers. The browser never receives those credentials.
+4. Authenticated website users can read `GET /sensors`, `GET /network/overview`, `GET /network/snapshots`, `GET /network/interfaces`, `GET /network/devices`, and the existing `GET /assets` endpoint. Sensor-derived assets have `source: "sensor"` and `isDemo: false`.
+
+The default sensor mode reads Windows' local neighbour table. Explicit subnet discovery (`-DiscoveryMode subnet -SubnetCidr ...`) and TCP availability checks (`-ServicePorts ...`) are opt-in, bounded, low-rate, and read-only. Values include timestamps and collection methods; unavailable values remain unavailable. A sensor is `active` only after a recent heartbeat and becomes `stale` after three heartbeat intervals. A changed SSID/BSSID/local address/subnet/gateway is stored as an informational observed-fact alert, not as a claim of malicious activity.
+
+Telemetry ingestion requires HTTPS, validates bounded payloads and IP/MAC fields, rate-limits each sensor/IP, hashes credentials with bcrypt, scopes reads to the owning user (or an administrator), and rejects duplicate `(sensor, client_observation_id)` snapshots. Revoke a sensor with `POST /sensors/:id/revoke`.
 
 
 ## SMTP password reset configuration
