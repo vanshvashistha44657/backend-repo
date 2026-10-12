@@ -23,7 +23,9 @@ function Get-Config {
   $file = if (Test-Path -LiteralPath $ConfigPath) { Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json } else { $null }
   $base = if ($ApiBaseUrl) { $ApiBaseUrl } elseif ($file.ApiBaseUrl) { [string]$file.ApiBaseUrl } else { "" }
   $id = if ($SensorId) { $SensorId } elseif ($file.SensorId) { [string]$file.SensorId } else { "" }
-  $secret = if ($SensorSecret) { $SensorSecret } elseif ($file.SensorSecretProtected) { ([System.Management.Automation.PSCredential]::new("sensor", (ConvertTo-SecureString ([string]$file.SensorSecretProtected))).GetNetworkCredential().Password } elseif ($file.SensorSecret) { [string]$file.SensorSecret } else { "" }
+  $secret = if ($SensorSecret) { $SensorSecret } elseif ($file.SensorSecretProtected) {
+    ([System.Management.Automation.PSCredential]::new("sensor", (ConvertTo-SecureString ([string]$file.SensorSecretProtected)))).GetNetworkCredential().Password
+  } elseif ($file.SensorSecret) { [string]$file.SensorSecret } else { "" }
   if (!$base -or !$id -or !$secret) { throw "ApiBaseUrl, SensorId and SensorSecret are required. Create the protected config file using sensor/README.md." }
   if ($base -notmatch '^https://') { throw "The sensor requires an HTTPS ApiBaseUrl." }
   return @{ ApiBaseUrl = $base.TrimEnd('/'); SensorId = $id; SensorSecret = $secret }
