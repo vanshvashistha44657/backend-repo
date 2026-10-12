@@ -225,6 +225,7 @@ app.get("/health/email", (req, res) => res.json(mailConfiguration()));
 
 /* ---------------------------------------------------------- network sensors */
 app.post("/sensors/enroll", requireAuth, async (req, res) => {
+  if (req.headers["sec-fetch-mode"] || req.headers["sec-fetch-site"] || req.headers["sec-fetch-dest"]) return res.status(403).json({ message: "Sensor enrollment must be performed by the documented local PowerShell procedure" });
   if (String(req.headers["x-sentinelops-enrollment"] || "").toLowerCase() !== "powershell") return res.status(403).json({ message: "Sensor enrollment must be performed from the documented PowerShell procedure" });
   const name = boundedString(req.body?.name, 80); if (!name) return res.status(400).json({ message: "Sensor name is required" });
   const sensorId = crypto.randomUUID(); const secret = randomToken();

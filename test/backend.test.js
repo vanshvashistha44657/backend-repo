@@ -183,6 +183,7 @@ test("two-user network privacy isolates sensors, telemetry, alerts, notification
   const authAdmin = { Authorization: `Bearer ${loginAdmin.body.token}` };
   const authManager = { Authorization: `Bearer ${loginManager.body.token}` };
   const enroll = async (auth, name, ownerUserId) => {
+    await request(app).post("/sensors/enroll").set({ ...auth, "X-SentinelOps-Enrollment": "powershell", "Sec-Fetch-Mode": "cors" }).send({ name }).expect(403);
     const response = await request(app).post("/sensors/enroll").set({ ...auth, "X-SentinelOps-Enrollment": "powershell" }).send({ name, hostname: name, platform: "windows", sensor_version: "isolation-test", owner_user_id: ownerUserId }).expect(201);
     assert.equal(Object.prototype.hasOwnProperty.call(response.body.credentials, "secret"), true);
     assert.equal(Object.prototype.hasOwnProperty.call(response.body.sensor, "secret"), false);
