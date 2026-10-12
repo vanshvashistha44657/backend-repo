@@ -50,3 +50,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\sensor\sentinelops-sen
 Optional TCP availability checks are read-only connection attempts and must be explicitly selected, for example `-ServicePorts 53,80,443`. A successful check means only that a TCP connection was accepted at that time; it does not identify software or prove authorization.
 
 The backend stores collection methods, timestamps, errors, and the distinction between observed values and unavailable values. A sensor is shown as active only after a recent successful heartbeat; it becomes stale after three heartbeat intervals.
+
+For isolated local integration tests only, the backend may be run with `ALLOW_INSECURE_SENSOR_LOCAL=true` and the sensor may use `-AllowInsecureLocal -ApiBaseUrl http://127.0.0.1:...`. Never use that exception for a real laptop or production service.

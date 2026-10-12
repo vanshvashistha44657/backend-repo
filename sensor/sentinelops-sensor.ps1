@@ -9,6 +9,7 @@ param(
   [ValidateRange(15, 3600)][int]$IntervalSeconds = 60,
   [ValidateRange(1, 1024)][int]$MaxHosts = 254,
   [string]$PidPath = "$env:ProgramData\SentinelOps\sensor.pid",
+  [switch]$AllowInsecureLocal,
   [switch]$Once
 )
 
@@ -27,7 +28,10 @@ function Get-Config {
     ([System.Management.Automation.PSCredential]::new("sensor", (ConvertTo-SecureString ([string]$file.SensorSecretProtected)))).GetNetworkCredential().Password
   } elseif ($file.SensorSecret) { [string]$file.SensorSecret } else { "" }
   if (!$base -or !$id -or !$secret) { throw "ApiBaseUrl, SensorId and SensorSecret are required. Create the protected config file using sensor/README.md." }
-  if ($base -notmatch '^https://') { throw "The sensor requires an HTTPS ApiBaseUrl." }
+  if ($base -notmatch '^https://') {
+    $uri = [Uri]$base
+    if (!$AllowInsecureLocal -or $uri.Scheme -ne "http" -or $uri.Host -notin @("127.0.0.1", "localhost", "::1")) { throw "The sensor requires an HTTPS ApiBaseUrl. AllowInsecureLocal is restricted to loopback integration tests." }
+  }
   return @{ ApiBaseUrl = $base.TrimEnd('/'); SensorId = $id; SensorSecret = $secret }
 }
 
@@ -59,11 +63,11 @@ function Get-NetworkObservation([System.Collections.Generic.List[object]]$Errors
     try { $adapter = Get-NetAdapter -Name $config.InterfaceAlias -ErrorAction Stop } catch { Add-CollectionError $Errors "Get-NetAdapter" $_.Exception.Message }
     $ips = @($config.IPv4Address | ForEach-Object { $_.IPAddress })
     if (!$ips) { $ips = @($config.IPv6Address | ForEach-Object { $_.IPAddress }) }
+    $adapterState = "unknown"; $adapterType = "unknown"; $adapterMac = ""
+    if ($adapter) { $adapterState = [string]$adapter.Status; $adapterType = [string]$adapter.MediaType; $adapterMac = [string]$adapter.MacAddress }
     $interfaces.Add(@{
       name = [string]$config.InterfaceAlias; alias = [string]$config.InterfaceAlias
-      state = if ($adapter) { [string]$adapter.Status } else { "unknown" }
-      connection_type = if ($adapter) { [string]$adapter.MediaType } else { "unknown" }
-      mac = if ($adapter) { [string]$adapter.MacAddress } else { "" }
+      state = $adapterState; connection_type = $adapterType; mac = $adapterMac
       local_ips = @($ips); collection_method = "Get-NetIPConfiguration/Get-NetAdapter"
     })
   }
@@ -73,10 +77,12 @@ function Get-NetworkObservation([System.Collections.Generic.List[object]]$Errors
   $ip = if ($local) { [string]$local[0].IPAddress } else { $null }
   $prefix = if ($local) { [int]$local[0].PrefixLength } else { $null }
   $subnet = if ($ip -and $null -ne $prefix) { "$ip/$prefix" } else { $null }
-  return @{
-    connection = @{ state = if ($wifi.state -eq "connected") { "connected" } elseif ($ip) { "connected" } else { "disconnected" }; ssid = $wifi.ssid; bssid = $wifi.bssid; local_ip = $ip; subnet = $subnet; gateway = $gateway; dns = @($dns); signal = @{ percent = $wifi.signal_percent; rssi_dbm = $wifi.rssi_dbm; link_speed_mbps = $wifi.link_speed_mbps } }
-    interfaces = @($interfaces); wifi = $wifi; primary_ip = $ip; primary_prefix = $prefix
-  }
+  $connectionState = "disconnected"
+  if ($wifi.state -eq "connected" -or $ip) { $connectionState = "connected" }
+  $result = @{}
+  $result["connection"] = @{ state = $connectionState; ssid = $wifi.ssid; bssid = $wifi.bssid; local_ip = $ip; subnet = $subnet; gateway = $gateway; dns = @($dns); signal = @{ percent = $wifi.signal_percent; rssi_dbm = $wifi.rssi_dbm; link_speed_mbps = $wifi.link_speed_mbps } }
+  $result["interfaces"] = @($interfaces.ToArray()); $result["wifi"] = $wifi; $result["primary_ip"] = $ip; $result["primary_prefix"] = $prefix
+  return $result
 }
 
 function Get-Ipv4UInt([string]$Ip) {
@@ -126,9 +132,14 @@ function Get-NeighbourDevices([System.Collections.Generic.List[object]]$Errors, 
       try { $task = $client.ConnectAsync($device.ip, $port); $available = $task.Wait(400) -and $client.Connected } catch { } finally { $client.Dispose() }
       $services.Add(@{ port = $port; protocol = "tcp"; available = $available; method = "TcpClient.ConnectAsync" }); Start-Sleep -Milliseconds 75
     }
-    $result.Add(@{ ip = $device.ip; mac = $device.mac; hostname = $hostname; vendor = $null; state = $device.state; services = @($services); collection_methods = @($device.collection_methods) + $(if ($hostname) { @("Resolve-DnsName PTR") } else { @() }) })
+    $methods = @($device.collection_methods)
+    if ($hostname) { $methods += "Resolve-DnsName PTR" }
+    $deviceResult = @{}
+    $deviceResult["ip"] = $device.ip; $deviceResult["mac"] = $device.mac; $deviceResult["hostname"] = $hostname; $deviceResult["vendor"] = $null; $deviceResult["state"] = $device.state
+    $deviceResult["services"] = @($services.ToArray()); $deviceResult["collection_methods"] = $methods
+    $result.Add($deviceResult)
   }
-  return @($result)
+  return @($result.ToArray())
 }
 
 function Send-SensorJson([hashtable]$Config, [string]$Path, [object]$Payload, [hashtable]$Headers) {
@@ -148,9 +159,12 @@ try {
       $network = Get-NetworkObservation $errors
       $devices = Get-NeighbourDevices $errors $DiscoveryMode $SubnetCidr $MaxHosts $ServicePorts
       $observedAt = (Get-Date).ToUniversalTime().ToString("o")
-      $heartbeat = @{ observed_at = $observedAt; hostname = $env:COMPUTERNAME; platform = "windows"; sensor_version = "1.0"; heartbeat_interval_seconds = $IntervalSeconds; collection_errors = @($errors) }
+      $errorArray = @($errors.ToArray())
+      $heartbeat = @{}
+      $heartbeat["observed_at"] = $observedAt; $heartbeat["hostname"] = $env:COMPUTERNAME; $heartbeat["platform"] = "windows"; $heartbeat["sensor_version"] = "1.0"; $heartbeat["heartbeat_interval_seconds"] = $IntervalSeconds; $heartbeat["collection_errors"] = $errorArray
       Send-SensorJson $config "/sensor/v1/heartbeat" $heartbeat $headers | Out-Null
-      $snapshot = @{ client_observation_id = [guid]::NewGuid().ToString(); observed_at = $observedAt; hostname = $env:COMPUTERNAME; platform = "windows"; sensor_version = "1.0"; connection = $network.connection; interfaces = @($network.interfaces); devices = @($devices); collection_methods = @("Get-NetIPConfiguration", "Get-NetAdapter", "Get-NetNeighbor", "netsh wlan show interfaces"); collection_errors = @($errors) }
+      $snapshot = @{}
+      $snapshot["client_observation_id"] = [guid]::NewGuid().ToString(); $snapshot["observed_at"] = $observedAt; $snapshot["hostname"] = $env:COMPUTERNAME; $snapshot["platform"] = "windows"; $snapshot["sensor_version"] = "1.0"; $snapshot["connection"] = $network.connection; $snapshot["interfaces"] = $network.interfaces; $snapshot["devices"] = $devices; $snapshot["collection_methods"] = @("Get-NetIPConfiguration", "Get-NetAdapter", "Get-NetNeighbor", "netsh wlan show interfaces"); $snapshot["collection_errors"] = $errorArray
       $result = Send-SensorJson $config "/sensor/v1/snapshots" $snapshot $headers
       Write-Host ("{0} snapshot={1} devices={2} errors={3}" -f (Get-Date).ToUniversalTime().ToString("o"), $result.snapshotId, $result.devicesAccepted, $errors.Count)
     } catch { Write-Warning ("Sensor collection/ingestion failed: " + $_.Exception.Message) }
